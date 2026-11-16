@@ -516,10 +516,33 @@ func containsAgentError(msg string) bool {
 // parseAgentNotRunning extracts node and vmid from an agent API path and
 // returns ErrAgentNotRunning. Falls back to a generic error if parsing fails.
 func parseAgentNotRunning(path string) error {
-	var node string
-	var vmid int
-	//nolint:errcheck // best-effort parse; fallback to generic message
-	_, _ = fmt.Sscanf(path, "/api2/json/nodes/%s/qemu/%d/agent/", &node, &vmid)
+	const (
+		prefix      = "/api2/json/nodes/"
+		qemuMarker  = "/qemu/"
+		agentMarker = "/agent/"
+	)
+	if !strings.HasPrefix(path, prefix) {
+		return fmt.Errorf("parsing Proxmox agent path %q: missing nodes prefix", path)
+	}
+
+	rest := strings.TrimPrefix(path, prefix)
+	qemuIndex := strings.Index(rest, qemuMarker)
+	if qemuIndex <= 0 || strings.Contains(rest[:qemuIndex], "/") {
+		return fmt.Errorf("parsing Proxmox agent path %q: invalid node segment", path)
+	}
+	node := rest[:qemuIndex]
+	afterQEMU := rest[qemuIndex+len(qemuMarker):]
+	agentIndex := strings.Index(afterQEMU, agentMarker)
+	if agentIndex <= 0 {
+		return fmt.Errorf("parsing Proxmox agent path %q: invalid VMID segment", path)
+	}
+	vmid, err := strconv.Atoi(afterQEMU[:agentIndex])
+	if err != nil {
+		return fmt.Errorf("parsing Proxmox agent path %q: invalid VMID: %w", path, err)
+	}
+	if afterQEMU[agentIndex+len(agentMarker):] == "" {
+		return fmt.Errorf("parsing Proxmox agent path %q: missing agent operation", path)
+	}
 	return &ErrAgentNotRunning{Node: node, VMID: vmid}
 }
 

@@ -412,8 +412,8 @@ func TestProxmoxStatefulLifecycleRestartCleansConfirmedDeleteFromStateAndOwnersh
 	if _, err := r.Reconcile(ctx); err != nil {
 		t.Fatalf("first absent observation: %v", err)
 	}
-	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 {
-		t.Fatalf("first absent observation removed DNS: %+v", answers)
+	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 || answers[0].Hostname != "web.test-cluster.example.com" || answers[0].Target != "10.20.0.10" {
+		t.Fatalf("first absent observation changed retained DNS: %+v", answers)
 	}
 
 	// The new reconciler has no previousDesired or knownHostnames. Recovering

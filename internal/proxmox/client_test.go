@@ -163,6 +163,62 @@ func TestGetVMAgentNetworks_AgentNotRunning(t *testing.T) {
 	var agentErr *ErrAgentNotRunning
 	if !errors.As(err, &agentErr) {
 		t.Errorf("expected *ErrAgentNotRunning, got %T: %v", err, err)
+		return
+	}
+	if agentErr.Node != "pve-00" || agentErr.VMID != 100 {
+		t.Errorf("agent error identity = %s/%d, want pve-00/100", agentErr.Node, agentErr.VMID)
+	}
+}
+
+func TestParseAgentNotRunning(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		wantNode   string
+		wantVMID   int
+		wantParsed bool
+	}{
+		{
+			name:       "network operation path",
+			path:       "/api2/json/nodes/pve-00/qemu/100/agent/network-get-interfaces",
+			wantNode:   "pve-00",
+			wantVMID:   100,
+			wantParsed: true,
+		},
+		{
+			name:       "node is not allowed to consume the rest of the path",
+			path:       "/api2/json/nodes/pve-00/qemu/100/agent/network-get-interfaces/extra",
+			wantNode:   "pve-00",
+			wantVMID:   100,
+			wantParsed: true,
+		},
+		{
+			name:       "malformed path is not misattributed",
+			path:       "/api2/json/nodes/pve-00/qemu/not-a-vmid/agent/network-get-interfaces",
+			wantParsed: false,
+		},
+		{
+			name:       "missing operation is rejected",
+			path:       "/api2/json/nodes/pve-00/qemu/100/agent/",
+			wantParsed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := parseAgentNotRunning(tt.path)
+			var agentErr *ErrAgentNotRunning
+			parsed := errors.As(err, &agentErr)
+			if parsed != tt.wantParsed {
+				t.Fatalf("parseAgentNotRunning parsed=%v, want %v; err=%v", parsed, tt.wantParsed, err)
+			}
+			if !tt.wantParsed {
+				return
+			}
+			if agentErr.Node != tt.wantNode || agentErr.VMID != tt.wantVMID {
+				t.Errorf("agent error identity = %s/%d, want %s/%d", agentErr.Node, agentErr.VMID, tt.wantNode, tt.wantVMID)
+			}
+		})
 	}
 }
 

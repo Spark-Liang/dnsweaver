@@ -404,7 +404,11 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 		))
 	}
 
-	collisionKeys, collisionNames := collisionIdentities(snapshot.Resources, a, clusterName)
+	// Only resources inside the configured management filters are eligible to
+	// freeze a managed DNS name. Out-of-scope nodes/tags remain part of the
+	// complete inventory for deletion safety but cannot block this adapter's
+	// desired state.
+	collisionKeys, collisionNames := collisionIdentities(resources, a, clusterName)
 	for key := range collisionKeys {
 		if record, ok := next.Instances[key]; ok {
 			record.Collision = true

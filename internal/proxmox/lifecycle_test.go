@@ -21,6 +21,7 @@ type lifecycleTestServer struct {
 	agentDelay           time.Duration
 	nullInventory        bool
 	clusterStatusMissing bool
+	clusterStatusError   bool
 	clusterName          string
 }
 
@@ -37,6 +38,10 @@ func (s *lifecycleTestServer) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": resources})
 	case r.URL.Path == "/api2/json/cluster/status":
+		if s.clusterStatusError {
+			http.Error(w, "cluster status unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if s.clusterStatusMissing {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []ClusterStatusEntry{{Type: "node", Name: "pve-00"}}})
 			return
@@ -282,13 +287,48 @@ func TestStatefulLifecycleNameCollisionBlocksHostname(t *testing.T) {
 		t.Fatalf("collision workloads = %d, want 2", len(workloads))
 	}
 	status := adapter.SnapshotStatus()
-	if status.AllowOrphanCleanup || len(status.BlockedHostnames) != 1 || status.BlockedHostnames[0] != "web.example.com" {
+	if status.AllowOrphanCleanup || len(status.BlockedHostnames) != 1 || status.BlockedHostnames[0] != "web.test-cluster.example.com" {
 		t.Fatalf("collision snapshot status = %+v", status)
 	}
 	for _, workload := range workloads {
 		if got := workload.Metadata["proxmox.lifecycle.state"]; got != LifecycleStateNameCollision {
 			t.Fatalf("collision workload state = %q, want %q", got, LifecycleStateNameCollision)
 		}
+	}
+}
+
+func TestStatefulLifecycleCollisionIgnoresFilteredResources(t *testing.T) {
+	fixture := &lifecycleTestServer{
+		resources: []ClusterResource{
+			{VMID: 100, Name: "web", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning},
+			{VMID: 101, Name: "WEB", Node: "pve-01", Type: resourceTypeQEMU, Status: stateRunning},
+		},
+		interfaces: []AgentNetworkInterface{{Name: "eth0", IPAddresses: []AgentIPAddress{{IPAddress: "10.20.0.10"}}}},
+	}
+	server, client := newTestServer(t, fixture.handler)
+	t.Cleanup(server.Close)
+	adapter := NewWorkloadListerAdapter(client, AdapterConfig{
+		LifecycleMode:               LifecycleModeStateful,
+		LifecycleStateFile:          filepath.Join(t.TempDir(), "lifecycle.json"),
+		LifecycleScopeConfirmed:     true,
+		LifecycleDeleteObservations: 2,
+		NodeFilter:                  "pve-00",
+		VMZone:                      "example.com",
+	}, testLogger())
+
+	workloads, err := adapter.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("filtered collision ListWorkloads: %v", err)
+	}
+	if len(workloads) != 1 || workloads[0].Name != "web" {
+		t.Fatalf("filtered collision workloads = %+v, want only managed web", workloads)
+	}
+	status := adapter.SnapshotStatus()
+	if len(status.BlockedHostnames) != 0 {
+		t.Fatalf("filtered resource froze managed hostname: %+v", status.BlockedHostnames)
+	}
+	if got := workloads[0].Metadata["proxmox.lifecycle.state"]; got == LifecycleStateNameCollision {
+		t.Fatalf("managed workload was marked as a collision: %q", got)
 	}
 }
 
@@ -372,6 +412,33 @@ func TestStatefulLifecycleDoesNotUseEndpointHostAsClusterName(t *testing.T) {
 	}
 	if adapter.SnapshotStatus().AllowOrphanCleanup {
 		t.Fatal("missing actual cluster name enabled orphan cleanup")
+	}
+}
+
+func TestStatefulLifecycleClusterStatusFailureBlocksCleanup(t *testing.T) {
+	fixture := statefulQEMUFixture()
+	stateFile := filepath.Join(t.TempDir(), "lifecycle.json")
+	server, client := newTestServer(t, fixture.handler)
+	t.Cleanup(server.Close)
+	adapter := NewWorkloadListerAdapter(client, AdapterConfig{
+		LifecycleMode:               LifecycleModeStateful,
+		LifecycleStateFile:          stateFile,
+		LifecycleScopeConfirmed:     true,
+		LifecycleDeleteObservations: 2,
+		VMZone:                      "example.com",
+	}, testLogger())
+	if _, err := adapter.ListWorkloads(context.Background()); err != nil {
+		t.Fatalf("initial ListWorkloads: %v", err)
+	}
+
+	fixture.resources = nil
+	fixture.clusterStatusError = true
+	if _, err := adapter.ListWorkloads(context.Background()); err == nil {
+		t.Fatal("cluster status API failure was treated as a successful lifecycle snapshot")
+	}
+	status := adapter.SnapshotStatus()
+	if status.Complete || status.AllowOrphanCleanup {
+		t.Fatalf("cluster status failure left cleanup enabled: %+v", status)
 	}
 }
 

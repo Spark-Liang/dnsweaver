@@ -104,14 +104,17 @@ slice; it does not alter source/provider behavior in legacy mode.
 
 ## Name collision freeze
 
-When two distinct stateful identities produce the same normalized DNS name,
-the adapter reports the name as blocked and the reconciler skips all sets at
-that name. Existing records remain untouched; no automatic create, update,
-delete, or automatic numeric suffix is attempted. If one colliding instance is
-only `absent-pending`, it is still emitted with its retained name/address, so
-the claims layer continues to freeze the name until deletion is confirmed.
-The name is unblocked only after the inventory contains a single remaining
-identity or the other generation is confirmed deleted.
+When two distinct stateful identities inside the configured management filters
+produce the same normalized DNS name, the adapter reports the name as blocked
+and the reconciler skips all sets at that name. Resources outside the node or
+tag filters remain visible to the complete inventory safety gate, but do not
+freeze names that this adapter is not managing. Existing records remain
+untouched; no automatic create, update, delete, or automatic numeric suffix is
+attempted. If one colliding instance is only `absent-pending`, it is still
+emitted with its retained name/address, so the claims layer continues to freeze
+the name until deletion is confirmed. The name is unblocked only after the
+inventory contains a single remaining identity or the other generation is
+confirmed deleted.
 
 ## Address selection
 
