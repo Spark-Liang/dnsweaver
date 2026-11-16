@@ -356,6 +356,12 @@ func (c *Config) ProxmoxDomainSuffix() string {
 	return c.Global.ProxmoxDomainSuffix
 }
 
+// ProxmoxVMZone returns the final DNS zone used by strict stateful lifecycle
+// names.
+func (c *Config) ProxmoxVMZone() string {
+	return c.Global.ProxmoxVMZone
+}
+
 // ProxmoxHostnameTagPrefix returns the optional tag prefix used to derive an
 // explicit hostname from Proxmox tags.
 func (c *Config) ProxmoxHostnameTagPrefix() string {

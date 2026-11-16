@@ -98,10 +98,11 @@ type FileKubernetesConfig struct {
 
 // FileProxmoxConfig holds the fork's opt-in lifecycle controls.
 type FileProxmoxConfig struct {
-	LifecycleMode              string `yaml:"lifecycle_mode,omitempty"`
-	LifecycleStateFile         string `yaml:"lifecycle_state_file,omitempty"`
-	LifecycleScopeConfirmed    *bool  `yaml:"lifecycle_scope_confirmed,omitempty"`
+	LifecycleMode               string `yaml:"lifecycle_mode,omitempty"`
+	LifecycleStateFile          string `yaml:"lifecycle_state_file,omitempty"`
+	LifecycleScopeConfirmed     *bool  `yaml:"lifecycle_scope_confirmed,omitempty"`
 	LifecycleDeleteObservations *int  `yaml:"lifecycle_delete_observations,omitempty"`
+	VMZone                      string `yaml:"vm_zone,omitempty"`
 }
 
 // FileSourceConfig holds configuration for a hostname source.
@@ -294,9 +295,9 @@ func (c *FileConfig) ToGlobalConfig() *GlobalConfig {
 		K8sWatchHTTPRoute:    true,
 		K8sWatchServices:     false,
 		Source:               DefaultSource,
-		ProxmoxLifecycleMode: DefaultProxmoxLifecycleMode,
-		ProxmoxLifecycleStateFile: DefaultProxmoxLifecycleStateFile,
-		ProxmoxLifecycleScopeConfirmed: DefaultProxmoxLifecycleScopeConfirmed,
+		ProxmoxLifecycleMode:              DefaultProxmoxLifecycleMode,
+		ProxmoxLifecycleStateFile:         DefaultProxmoxLifecycleStateFile,
+		ProxmoxLifecycleScopeConfirmed:    DefaultProxmoxLifecycleScopeConfirmed,
 		ProxmoxLifecycleDeleteObservations: DefaultProxmoxLifecycleDeleteObservations,
 	}
 
@@ -392,6 +393,9 @@ func (c *FileConfig) ToGlobalConfig() *GlobalConfig {
 		}
 		if c.Proxmox.LifecycleDeleteObservations != nil {
 			cfg.ProxmoxLifecycleDeleteObservations = *c.Proxmox.LifecycleDeleteObservations
+		}
+		if c.Proxmox.VMZone != "" {
+			cfg.ProxmoxVMZone = strings.Trim(strings.TrimSpace(c.Proxmox.VMZone), ".")
 		}
 	}
 

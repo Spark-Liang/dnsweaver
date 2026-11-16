@@ -329,6 +329,11 @@ full setup including the required PVE role privileges.
 | `DNSWEAVER_PROXMOX_STATE_FILTER` | No | `running` | Resource status filter (`running`, `stopped`, etc.) |
 | `DNSWEAVER_PROXMOX_IP_VERSION` | No | `ipv4` | Address families to resolve: `ipv4` (A records), `ipv6` (AAAA records), or `dual` (both). |
 | `DNSWEAVER_PROXMOX_DOMAIN_SUFFIX` | No | — | Domain suffix appended to VM names |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_MODE` | No | `legacy` | Set to `stateful` to enable persisted lifecycle state, stopped VM retention, confirmed deletion, and collision freeze. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_STATE_FILE` | No | `proxmox-lifecycle.json` | Durable JSON state path for stateful lifecycle mode; one process must own the file. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_SCOPE_CONFIRMED` | No | `false` | Operator declaration that the PVE inventory scope is complete; it does not verify permissions or pagination automatically. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS` | No | `2` | Consecutive complete absent inventories required before deletion. |
+| `DNSWEAVER_PROXMOX_VM_ZONE` | Required for `stateful` | — | Final zone in strict names `<PVE name>.<actual cluster name>.<VM_ZONE>`; stateful mode ignores hostname tag overrides. |
 
 ## Provider-Specific Settings
 

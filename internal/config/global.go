@@ -37,9 +37,9 @@ const (
 	DefaultSource               = "traefik"
 	DefaultInstanceID           = ""
 	DefaultPlatform             = "docker"
-	DefaultProxmoxLifecycleMode = "legacy"
-	DefaultProxmoxLifecycleStateFile = "proxmox-lifecycle.json"
-	DefaultProxmoxLifecycleScopeConfirmed = false
+	DefaultProxmoxLifecycleMode               = "legacy"
+	DefaultProxmoxLifecycleStateFile         = "proxmox-lifecycle.json"
+	DefaultProxmoxLifecycleScopeConfirmed    = false
 	DefaultProxmoxLifecycleDeleteObservations = 2
 )
 
@@ -103,6 +103,7 @@ type GlobalConfig struct {
 	ProxmoxTagFilter          string   // Optional: prefix match on PVE tags to filter workloads
 	ProxmoxStateFilter        string   // Filter by PVE resource status (default: "running")
 	ProxmoxDomainSuffix       string   // Domain suffix to append to VM names (e.g., "home.example.com")
+	ProxmoxVMZone             string   // Final DNS zone for stateful names: <name>.<cluster>.<zone>
 	ProxmoxHostnameTagPrefix  string   // Optional: tag prefix for hostname override tags (e.g. "dnsweaver")
 	ProxmoxInterfaceTagPrefix string   // Optional: tag prefix for interface selection tags (e.g. "dnsweaver")
 	ProxmoxAllowedInterfaces  []string // Optional allow-list of guest interface names for IP resolution
@@ -450,6 +451,7 @@ func loadGlobalConfig() (*GlobalConfig, []*ConfigError) {
 	cfg.ProxmoxTagFilter = getEnv("DNSWEAVER_PROXMOX_TAG_FILTER")
 	cfg.ProxmoxStateFilter = getEnv("DNSWEAVER_PROXMOX_STATE_FILTER")
 	cfg.ProxmoxDomainSuffix = getEnv("DNSWEAVER_PROXMOX_DOMAIN_SUFFIX")
+	cfg.ProxmoxVMZone = strings.Trim(strings.TrimSpace(getEnv("DNSWEAVER_PROXMOX_VM_ZONE")), ".")
 	cfg.ProxmoxHostnameTagPrefix = getEnv("DNSWEAVER_PROXMOX_HOSTNAME_TAG_PREFIX")
 	cfg.ProxmoxInterfaceTagPrefix = getEnv("DNSWEAVER_PROXMOX_INTERFACE_TAG_PREFIX")
 	cfg.ProxmoxAllowedInterfaces = splitPatterns(getEnv("DNSWEAVER_PROXMOX_ALLOWED_INTERFACES"))
@@ -572,6 +574,9 @@ func applyProxmoxLifecycleEnv(cfg *GlobalConfig, errs *[]*ConfigError) {
 	}
 	if cfg.ProxmoxLifecycleDeleteObservations == 0 {
 		cfg.ProxmoxLifecycleDeleteObservations = DefaultProxmoxLifecycleDeleteObservations
+	}
+	if v := getEnv("DNSWEAVER_PROXMOX_VM_ZONE"); v != "" {
+		cfg.ProxmoxVMZone = strings.Trim(strings.TrimSpace(v), ".")
 	}
 
 	if v := getEnv("DNSWEAVER_PROXMOX_LIFECYCLE_MODE"); v != "" {

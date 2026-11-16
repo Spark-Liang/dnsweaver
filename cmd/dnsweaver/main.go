@@ -330,12 +330,13 @@ func run() error {
 			InterfacePreference: cfg.ProxmoxInterfaceTagPrefix(),
 			AllowedInterfaces:   cfg.ProxmoxAllowedInterfaces(),
 			IPVersion:           proxmoxIPVersion(cfg),
-			LifecycleMode:       cfg.ProxmoxLifecycleMode(),
-			LifecycleStateFile:  cfg.ProxmoxLifecycleStateFile(),
-			LifecycleScopeConfirmed: cfg.ProxmoxLifecycleScopeConfirmed(),
+			LifecycleMode:               cfg.ProxmoxLifecycleMode(),
+			LifecycleStateFile:          cfg.ProxmoxLifecycleStateFile(),
+			LifecycleScopeConfirmed:     cfg.ProxmoxLifecycleScopeConfirmed(),
 			LifecycleDeleteObservations: cfg.ProxmoxLifecycleDeleteObservations(),
-			DomainSuffix:        cfg.ProxmoxDomainSuffix(),
-			HostnameTagPrefix:   cfg.ProxmoxHostnameTagPrefix(),
+			DomainSuffix:                cfg.ProxmoxDomainSuffix(),
+			HostnameTagPrefix:           cfg.ProxmoxHostnameTagPrefix(),
+			VMZone:                      cfg.ProxmoxVMZone(),
 		}, logger)
 		listers = append(listers, proxmoxLister)
 		logger.Info("proxmox lister configured",

@@ -82,7 +82,15 @@ func validateConfig(cfg *Config) []*ConfigError {
 			"DNSWEAVER_PROXMOX_LIFECYCLE_MODE=stateful",
 		))
 	}
-	if cfg.Global.ProxmoxLifecycleDeleteObservations < 0 {
+	if cfg.Global.ProxmoxLifecycleMode == "stateful" && strings.Trim(strings.TrimSpace(cfg.Global.ProxmoxVMZone), ".") == "" {
+		errs = append(errs, configErrFull(
+			"proxmox.vm_zone",
+			"is required when proxmox.lifecycle_mode is stateful",
+			"Stateful DNS names are <PVE name>.<cluster name>.<vm zone>; the zone is deployment-specific and is not reported by PVE",
+			"DNSWEAVER_PROXMOX_VM_ZONE=example.com",
+		))
+	}
+	if cfg.Global.ProxmoxLifecycleDeleteObservations < 1 {
 		errs = append(errs, configErrFull(
 			"proxmox.lifecycle_delete_observations",
 			"must be at least 1",

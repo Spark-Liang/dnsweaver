@@ -8,17 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type lifecycleTestServer struct {
-	resources []ClusterResource
-	interfaces []AgentNetworkInterface
-	agentError bool
-	agentEmpty bool
-	agentDelay time.Duration
-	nullInventory bool
+	resources            []ClusterResource
+	interfaces           []AgentNetworkInterface
+	agentError           bool
+	agentEmpty           bool
+	agentDelay           time.Duration
+	nullInventory        bool
+	clusterStatusMissing bool
+	clusterName          string
 }
 
 func (s *lifecycleTestServer) handler(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +36,16 @@ func (s *lifecycleTestServer) handler(w http.ResponseWriter, r *http.Request) {
 			resources = []ClusterResource{}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": resources})
+	case r.URL.Path == "/api2/json/cluster/status":
+		if s.clusterStatusMissing {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []ClusterStatusEntry{{Type: "node", Name: "pve-00"}}})
+			return
+		}
+		name := s.clusterName
+		if name == "" {
+			name = "test-cluster"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []ClusterStatusEntry{{Type: "cluster", Name: name}}})
 	case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
 		if s.agentDelay > 0 {
 			select {
@@ -67,11 +80,12 @@ func newStatefulTestAdapter(t *testing.T, fixture *lifecycleTestServer, stateFil
 	t.Helper()
 	server, client := newTestServer(t, fixture.handler)
 	adapter := NewWorkloadListerAdapter(client, AdapterConfig{
-		LifecycleMode:              LifecycleModeStateful,
-		LifecycleStateFile:         stateFile,
-		LifecycleScopeConfirmed:    true,
+		LifecycleMode:               LifecycleModeStateful,
+		LifecycleStateFile:          stateFile,
+		LifecycleScopeConfirmed:     true,
 		LifecycleDeleteObservations: 2,
-		DomainSuffix:               "example.com",
+		DomainSuffix:                "example.com",
+		VMZone:                      "example.com",
 	}, testLogger())
 	return adapter, server.Close
 }
@@ -89,7 +103,10 @@ func TestStatefulLifecycleRetainsTransientAddressAndRestoresAfterRestart(t *test
 	if got := workloads[0].Metadata[metaKeyIP]; got != "10.20.0.10" {
 		t.Fatalf("initial address = %q, want 10.20.0.10", got)
 	}
-	if workloads[0].ID != adapter.client.ClusterIdentity()+"|qemu|100" {
+	if got := workloads[0].Metadata["proxmox.lifecycle.cluster_name"]; got != "test-cluster" {
+		t.Fatalf("cluster name = %q, want test-cluster", got)
+	}
+	if workloads[0].ID != "test-cluster|qemu|100" {
 		t.Fatalf("identity = %q, want cluster/type/vmid identity", workloads[0].ID)
 	}
 
@@ -217,7 +234,7 @@ func TestStatefulLifecycleConfirmedDeleteAndVMIDReuseDoNotInheritAddress(t *test
 	if _, ok := workloads[0].Metadata[metaKeyIP]; ok {
 		t.Fatalf("reused VMID inherited old address: %+v", workloads[0].Metadata)
 	}
-	if workloads[0].Name != "new-web" || workloads[0].ID != adapter.client.ClusterIdentity()+"|qemu|100" {
+	if workloads[0].Name != "new-web" || workloads[0].ID != "test-cluster|qemu|100" {
 		t.Fatalf("reused VMID identity/name = %q/%q", workloads[0].ID, workloads[0].Name)
 	}
 }
@@ -285,6 +302,8 @@ func TestStatefulLifecycleStrictInterfaceSelectionDoesNotFallback(t *testing.T) 
 		switch r.URL.Path {
 		case "/api2/json/cluster/resources":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": fixture.resources})
+		case "/api2/json/cluster/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []ClusterStatusEntry{{Type: "cluster", Name: "test-cluster"}}})
 		case "/api2/json/nodes/pve-00/lxc/200/config":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{
 				"net0": "name=eth0,ip=dhcp",
@@ -303,6 +322,7 @@ func TestStatefulLifecycleStrictInterfaceSelectionDoesNotFallback(t *testing.T) 
 		LifecycleStateFile:      filepath.Join(t.TempDir(), "lifecycle.json"),
 		LifecycleScopeConfirmed: true,
 		AllowedInterfaces:       []string{"eth9"},
+		VMZone:                  "example.com",
 	}, testLogger())
 	workloads, err := adapter.ListWorkloads(context.Background())
 	if err != nil {
@@ -321,7 +341,7 @@ func TestStatefulLifecycleNullInventoryIsNotDeletionEvidence(t *testing.T) {
 	fixture := statefulQEMUFixture()
 	server, client := newTestServer(t, fixture.handler)
 	t.Cleanup(server.Close)
-	adapter := NewWorkloadListerAdapter(client, AdapterConfig{LifecycleMode: LifecycleModeStateful, LifecycleStateFile: stateFile, LifecycleScopeConfirmed: true}, testLogger())
+	adapter := NewWorkloadListerAdapter(client, AdapterConfig{LifecycleMode: LifecycleModeStateful, LifecycleStateFile: stateFile, LifecycleScopeConfirmed: true, VMZone: "example.com"}, testLogger())
 	if _, err := adapter.ListWorkloads(context.Background()); err != nil {
 		t.Fatalf("initial ListWorkloads: %v", err)
 	}
@@ -332,6 +352,26 @@ func TestStatefulLifecycleNullInventoryIsNotDeletionEvidence(t *testing.T) {
 	}
 	if adapter.SnapshotStatus().AllowOrphanCleanup {
 		t.Fatal("null inventory enabled orphan cleanup")
+	}
+}
+
+func TestStatefulLifecycleDoesNotUseEndpointHostAsClusterName(t *testing.T) {
+	fixture := statefulQEMUFixture()
+	fixture.clusterStatusMissing = true
+	stateFile := filepath.Join(t.TempDir(), "lifecycle.json")
+	server, client := newTestServer(t, fixture.handler)
+	t.Cleanup(server.Close)
+	adapter := NewWorkloadListerAdapter(client, AdapterConfig{
+		LifecycleMode:           LifecycleModeStateful,
+		LifecycleStateFile:      stateFile,
+		LifecycleScopeConfirmed: true,
+		VMZone:                  "example.com",
+	}, testLogger())
+	if _, err := adapter.ListWorkloads(context.Background()); err == nil {
+		t.Fatal("stateful adapter accepted cluster status without an actual cluster name")
+	}
+	if adapter.SnapshotStatus().AllowOrphanCleanup {
+		t.Fatal("missing actual cluster name enabled orphan cleanup")
 	}
 }
 
@@ -347,5 +387,41 @@ func TestLifecycleStateFileCreatedWithPrivateMode(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("state mode = %o, want 600", info.Mode().Perm())
+	}
+	dirInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat state directory: %v", err)
+	}
+	if dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("state directory mode = %o, want 700", dirInfo.Mode().Perm())
+	}
+}
+
+func TestLifecycleStateStoreRejectsCorruptFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.json")
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt state: %v", err)
+	}
+	if _, err := newLifecycleStore(path).snapshot(); err == nil {
+		t.Fatal("corrupt lifecycle state was accepted")
+	}
+}
+
+func TestLifecycleStateStoreSerializesConcurrentCommits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent.json")
+	store := newLifecycleStore(path)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := store.commit(lifecycleFile{Schema: lifecycleSchemaVersion}); err != nil {
+				t.Errorf("concurrent state commit: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if _, err := store.snapshot(); err != nil {
+		t.Fatalf("read state after concurrent commits: %v", err)
 	}
 }

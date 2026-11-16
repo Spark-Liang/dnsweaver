@@ -147,6 +147,36 @@ func TestExtract_WithHostnameTagPrefixMissingFallsBack(t *testing.T) {
 	}
 }
 
+func TestExtract_StatefulUsesStrictNameAndIgnoresHostnameTag(t *testing.T) {
+	src := New(
+		WithDomain("legacy.example.com"),
+		WithHostnameTagPrefix("dnsweaver"),
+		WithVMZone("vm.example.com"),
+	)
+	w := workload.Workload{
+		Platform: workload.PlatformProxmox,
+		Name:     "Web",
+		Metadata: map[string]string{
+			"ip":                           "10.1.20.5",
+			"node":                         "pve-00",
+			"vmid":                         "100",
+			"tags":                         "dnsweaver+tag-override.vm.example.com",
+			"proxmox.lifecycle.mode":       "stateful",
+			"proxmox.lifecycle.cluster_name": "pve-cluster",
+		},
+	}
+	hostnames, err := src.Extract(context.Background(), w)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(hostnames) != 1 {
+		t.Fatalf("expected 1 hostname, got %d", len(hostnames))
+	}
+	if hostnames[0].Name != "web.pve-cluster.vm.example.com" {
+		t.Fatalf("strict stateful hostname = %q, want %q", hostnames[0].Name, "web.pve-cluster.vm.example.com")
+	}
+}
+
 func TestExtract_NameIsFQDN(t *testing.T) {
 	src := New() // no domain — VM name is already FQDN
 	w := workload.Workload{

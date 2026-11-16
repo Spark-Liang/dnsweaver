@@ -63,10 +63,11 @@ func ParseTargetMode(s string) (TargetMode, error) {
 
 // Proxmox implements the source.Source interface for Proxmox VE workloads.
 type Proxmox struct {
-	domain            string
-	targetMode        TargetMode
-	hostnameTagPrefix string
-	logger            *slog.Logger
+	domain                string
+	targetMode            TargetMode
+	hostnameTagPrefix     string
+	vmZone                string
+	logger                *slog.Logger
 }
 
 // Option is a functional option for configuring Proxmox.
@@ -91,13 +92,23 @@ func WithDomain(domain string) Option {
 	}
 }
 
-// WithHostnameTagPrefix sets an optional tag prefix used to derive an explicit
-// hostname from Proxmox tags. Tags matching "<prefix>+<hostname>" are treated
-// as hostname overrides. Explicit FQDN values are used verbatim, and bare
-// hostnames are appended with the configured domain suffix when present.
+// WithHostnameTagPrefix sets the legacy tag prefix used to derive an explicit
+// hostname from Proxmox tags. Stateful lifecycle workloads ignore this
+// override and use their strict PVE name instead. Tags matching
+// "<prefix>+<hostname>" are treated as hostname overrides in legacy mode.
+// Explicit FQDN values are used verbatim, and bare hostnames are appended with
+// the configured domain suffix when present.
 func WithHostnameTagPrefix(prefix string) Option {
 	return func(p *Proxmox) {
 		p.hostnameTagPrefix = strings.TrimSpace(prefix)
+	}
+}
+
+// WithVMZone sets the final DNS zone used by strict stateful lifecycle names.
+// A stateful workload is named <PVE name>.<cluster name>.<vm zone>.
+func WithVMZone(zone string) Option {
+	return func(p *Proxmox) {
+		p.vmZone = strings.Trim(strings.TrimSpace(zone), ".")
 	}
 }
 
@@ -225,6 +236,9 @@ func (p *Proxmox) Extract(_ context.Context, w workload.Workload) ([]source.Host
 // resolveHostname determines the FQDN for a given VM name.
 // Returns an error (logged as debug, not returned to caller) if no hostname can be determined.
 func (p *Proxmox) resolveHostname(w workload.Workload) (string, error) {
+	if w.Metadata["proxmox.lifecycle.mode"] == "stateful" {
+		return p.resolveStrictLifecycleHostname(w)
+	}
 	if tagHostname := p.resolveHostnameFromTags(w); tagHostname != "" {
 		return tagHostname, nil
 	}
@@ -236,6 +250,16 @@ func (p *Proxmox) resolveHostname(w workload.Workload) (string, error) {
 		return w.Name + "." + p.domain, nil
 	}
 	return "", fmt.Errorf("VM name %q is not an FQDN and no domain suffix is configured", w.Name)
+}
+
+func (p *Proxmox) resolveStrictLifecycleHostname(w workload.Workload) (string, error) {
+	name := strings.TrimSuffix(strings.TrimSpace(w.Name), ".")
+	cluster := strings.Trim(strings.TrimSpace(w.Metadata["proxmox.lifecycle.cluster_name"]), ".")
+	zone := strings.Trim(strings.TrimSpace(p.vmZone), ".")
+	if name == "" || cluster == "" || zone == "" {
+		return "", fmt.Errorf("stateful lifecycle name requires VM name, cluster name, and VM zone")
+	}
+	return strings.ToLower(name + "." + cluster + "." + zone), nil
 }
 
 func (p *Proxmox) resolveHostnameFromTags(w workload.Workload) string {

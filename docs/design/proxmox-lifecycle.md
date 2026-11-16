@@ -12,16 +12,22 @@ the existing Proxmox source, and the configured DNS provider.
 
 The state file is JSON and is replaced atomically. Its default path is
 `proxmox-lifecycle.json`; production deployments should set
-`DNSWEAVER_PROXMOX_LIFECYCLE_STATE_FILE` to a durable path. The in-process
-mutex serializes state reads and writes. This slice does not provide a
-cross-process lock, so one dnsweaver process must own a state file.
+`DNSWEAVER_PROXMOX_LIFECYCLE_STATE_FILE` to a durable path. The temporary file
+is mode `0600`, newly created parent directories are mode `0700`, and the
+temporary file and containing directory are synced before the update is
+considered complete. The in-process mutex serializes state reads and writes.
+Corrupt or unsupported-schema state is an error and blocks orphan cleanup; it
+is not treated as an empty state file.
+This slice does not provide a cross-process lock, so a deployment must ensure
+that exactly one dnsweaver process owns a state file. Stateful mode is not
+production-ready when that deployment gate cannot be enforced.
 
 ## Identity and generations
 
 The persisted instance key is:
 
 ```
-normalized PVE endpoint identity + resource type + VMID
+actual PVE cluster name + resource type + VMID
 ```
 
 The node and the display name are attributes, not identity. A node migration
@@ -30,7 +36,20 @@ same key starts a new generation and clears the old address before a new
 address is confirmed. Confirmed deletion leaves a generation tombstone so a
 later VMID reuse cannot inherit the old address.
 
-The original PVE `name` is retained in `workload.Workload.Name`.
+The original PVE `name` is retained in `workload.Workload.Name`. Stateful DNS
+names use the strict form:
+
+```
+<PVE name>.<actual PVE cluster name>.<VM_ZONE>
+```
+
+The cluster name is read from the `type=cluster` entry of `/cluster/status`;
+the API endpoint host is never used as a silent substitute. `VM_ZONE` is an
+explicit deployment setting (`DNSWEAVER_PROXMOX_VM_ZONE` or
+`proxmox.vm_zone`) because it is the DNS placement zone and is not a PVE
+cluster property. Stateful mode ignores `HOSTNAME_TAG_PREFIX` hostname
+overrides so a tag cannot replace the PVE name. Legacy mode keeps the existing
+tag and domain behavior.
 
 ## States
 
@@ -66,25 +85,33 @@ IP-resolution error other than QGA absence/timeout, or a failed state write
 returns an error and suppresses reconciler removals.
 
 Deletion also requires `DNSWEAVER_PROXMOX_LIFECYCLE_SCOPE_CONFIRMED=true`, an
-operator assertion that the API token can see the complete VM scope. The
-default policy requires two consecutive complete absent observations; tune it
-with `DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS`. Until confirmation,
+operator assertion that the API token can see the complete VM scope. This flag
+does not inspect PVE permissions, pagination, or scope automatically; it is a
+deployment declaration that must be verified by the operator. The default
+policy requires two consecutive complete absent observations; tune it with
+`DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS`. Until confirmation,
 the adapter emits the retained workload (when it has an address) and reports
 that orphan cleanup is unsafe. An initially empty inventory is not sufficient
 because the state file must first record a non-empty complete inventory.
 
 The reconciler consumes the optional lister snapshot status and suppresses
 member removals while the Proxmox snapshot is incomplete or lifecycle state is
-uncertain. This is a conservative cycle-wide removal gate in this first slice;
-it does not alter source/provider behavior in legacy mode.
+uncertain. A restarted reconciler must call its existing `RecoverOwnership`
+startup hook so provider ownership markers repopulate the in-memory orphan
+state; the lifecycle JSON persists the deletion observation and tombstone
+independently. This is a conservative cycle-wide removal gate in this first
+slice; it does not alter source/provider behavior in legacy mode.
 
 ## Name collision freeze
 
 When two distinct stateful identities produce the same normalized DNS name,
 the adapter reports the name as blocked and the reconciler skips all sets at
 that name. Existing records remain untouched; no automatic create, update,
-delete, or automatic numeric suffix is attempted. The name is unblocked only
-after the inventory contains a single remaining identity.
+delete, or automatic numeric suffix is attempted. If one colliding instance is
+only `absent-pending`, it is still emitted with its retained name/address, so
+the claims layer continues to freeze the name until deletion is confirmed.
+The name is unblocked only after the inventory contains a single remaining
+identity or the other generation is confirmed deleted.
 
 ## Address selection
 

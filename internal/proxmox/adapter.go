@@ -117,10 +117,12 @@ type AdapterConfig struct {
 	// snapshots required before an instance is confirmed deleted.
 	LifecycleDeleteObservations int
 
-	// DomainSuffix and HostnameTagPrefix mirror the Proxmox source. They are
-	// used only for lifecycle diagnostics and do not change source routing.
-	DomainSuffix       string
-	HostnameTagPrefix  string
+	// DomainSuffix and HostnameTagPrefix mirror the legacy Proxmox source.
+	// Stateful mode uses VMZone and the actual cluster name from /cluster/status
+	// for strict DNS naming; hostname tag overrides are ignored there.
+	DomainSuffix      string
+	HostnameTagPrefix string
+	VMZone            string // Final DNS zone for stateful names.
 }
 
 // WorkloadListerAdapter wraps a Proxmox Client to implement the workload.Lister interface.
@@ -175,12 +177,13 @@ func NewWorkloadListerAdapter(c *Client, cfg AdapterConfig, logger *slog.Logger)
 			InterfacePreference: cfg.InterfacePreference,
 			AllowedInterfaces:   cfg.AllowedInterfaces,
 			IPVersion:           ipVersion,
-			LifecycleMode:       lifecycleMode,
-			LifecycleStateFile:  stateFile,
-			LifecycleScopeConfirmed: cfg.LifecycleScopeConfirmed,
+			LifecycleMode:               lifecycleMode,
+			LifecycleStateFile:          stateFile,
+			LifecycleScopeConfirmed:     cfg.LifecycleScopeConfirmed,
 			LifecycleDeleteObservations: deleteObservations,
-			DomainSuffix:        cfg.DomainSuffix,
-			HostnameTagPrefix:   cfg.HostnameTagPrefix,
+			DomainSuffix:                cfg.DomainSuffix,
+			HostnameTagPrefix:           cfg.HostnameTagPrefix,
+			VMZone:                      strings.Trim(strings.TrimSpace(cfg.VMZone), "."),
 		},
 		logger:   logger,
 		store:    store,
@@ -262,6 +265,20 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 		a.setSnapshot(workload.SnapshotStatus{Complete: false, AllowOrphanCleanup: false})
 		return nil, fmt.Errorf("proxmox cluster resource inventory is incomplete")
 	}
+	clusterName, err := a.client.GetClusterName(ctx)
+	if err != nil {
+		a.setSnapshot(workload.SnapshotStatus{Complete: false, AllowOrphanCleanup: false})
+		return nil, fmt.Errorf("getting proxmox cluster name: %w", err)
+	}
+	clusterName = strings.Trim(strings.TrimSpace(clusterName), ".")
+	if clusterName == "" {
+		a.setSnapshot(workload.SnapshotStatus{Complete: false, AllowOrphanCleanup: false})
+		return nil, fmt.Errorf("getting proxmox cluster name: empty cluster name")
+	}
+	if strings.TrimSpace(a.cfg.VMZone) == "" {
+		a.setSnapshot(workload.SnapshotStatus{Complete: false, AllowOrphanCleanup: false})
+		return nil, fmt.Errorf("proxmox stateful lifecycle requires a VM zone")
+	}
 
 	state, err := a.store.snapshot()
 	if err != nil {
@@ -277,7 +294,7 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 	inventoryObserved := make(map[string]struct{}, len(snapshot.Resources))
 	filteredKeys := make(map[string]struct{})
 	for _, resource := range snapshot.Resources {
-		key := lifecycleIdentity(a.client.ClusterIdentity(), resource)
+		key := lifecycleIdentity(clusterName, resource)
 		if _, duplicate := inventoryObserved[key]; duplicate {
 			a.setSnapshot(workload.SnapshotStatus{Complete: false, AllowOrphanCleanup: false})
 			return nil, fmt.Errorf("duplicate Proxmox lifecycle identity %s", key)
@@ -302,7 +319,7 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 	now := time.Now().UTC()
 	workloads := make([]workload.Workload, 0, len(resources)+len(state.Instances))
 	for _, resource := range resources {
-		key := lifecycleIdentity(a.client.ClusterIdentity(), resource)
+		key := lifecycleIdentity(clusterName, resource)
 
 		record, exists := next.Instances[key]
 		if !exists {
@@ -329,6 +346,7 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 		record.Type = resource.Type
 		record.Name = resource.Name
 		record.Node = resource.Node
+		record.ClusterName = clusterName
 		record.LastSeenAt = now
 		record.MissingObservations = 0
 		record.Collision = false
@@ -386,7 +404,7 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 		))
 	}
 
-	collisionKeys, collisionNames := collisionIdentities(snapshot.Resources, a)
+	collisionKeys, collisionNames := collisionIdentities(snapshot.Resources, a, clusterName)
 	for key := range collisionKeys {
 		if record, ok := next.Instances[key]; ok {
 			record.Collision = true
@@ -470,19 +488,22 @@ func setLifecycleMetadata(w *workload.Workload, record lifecycleRecord, status s
 	w.Metadata["proxmox.lifecycle.generation"] = fmt.Sprintf("%d", record.Generation)
 	w.Metadata["proxmox.lifecycle.state"] = status
 	w.Metadata["proxmox.lifecycle.base_state"] = record.Status
+	if record.ClusterName != "" {
+		w.Metadata["proxmox.lifecycle.cluster_name"] = record.ClusterName
+	}
 	if record.Collision {
 		w.Metadata["proxmox.lifecycle.collision"] = "true"
 	}
 }
 
-func collisionIdentities(resources []ClusterResource, adapter *WorkloadListerAdapter) (map[string]struct{}, map[string]struct{}) {
+func collisionIdentities(resources []ClusterResource, adapter *WorkloadListerAdapter, clusterName string) (map[string]struct{}, map[string]struct{}) {
 	byName := make(map[string][]string)
 	for _, resource := range resources {
-		name := adapter.lifecycleName(resource)
+		name := adapter.lifecycleName(resource, clusterName)
 		if name == "" {
 			continue
 		}
-		key := lifecycleIdentity(adapter.client.ClusterIdentity(), resource)
+		key := lifecycleIdentity(clusterName, resource)
 		byName[name] = append(byName[name], key)
 	}
 	collisions := make(map[string]struct{})
@@ -508,7 +529,10 @@ func sortedNames(names map[string]struct{}) []string {
 	return result
 }
 
-func (a *WorkloadListerAdapter) lifecycleName(resource ClusterResource) string {
+func (a *WorkloadListerAdapter) lifecycleName(resource ClusterResource, clusterName string) string {
+	if a.cfg.LifecycleMode == LifecycleModeStateful {
+		return strictLifecycleName(resource.Name, clusterName, a.cfg.VMZone)
+	}
 	if a.cfg.HostnameTagPrefix != "" {
 		prefix := a.cfg.HostnameTagPrefix + "+"
 		for _, tag := range strings.Split(resource.Tags, ";") {
@@ -529,6 +553,16 @@ func (a *WorkloadListerAdapter) lifecycleName(resource ClusterResource) string {
 		name += "." + a.cfg.DomainSuffix
 	}
 	return strings.ToLower(strings.TrimSuffix(name, "."))
+}
+
+func strictLifecycleName(resourceName, clusterName, vmZone string) string {
+	resourceName = strings.TrimSuffix(strings.TrimSpace(resourceName), ".")
+	clusterName = strings.Trim(strings.TrimSpace(clusterName), ".")
+	vmZone = strings.Trim(strings.TrimSpace(vmZone), ".")
+	if resourceName == "" || clusterName == "" || vmZone == "" {
+		return ""
+	}
+	return strings.ToLower(resourceName + "." + clusterName + "." + vmZone)
 }
 
 // Platform returns PlatformProxmox, identifying this adapter as a Proxmox source.

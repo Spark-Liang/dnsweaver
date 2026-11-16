@@ -157,6 +157,7 @@ func registerSources(registry *source.Registry, cfg *config.Config, logger *slog
 			src := proxmoxsource.New(
 				proxmoxsource.WithDomain(cfg.ProxmoxDomainSuffix()),
 				proxmoxsource.WithHostnameTagPrefix(cfg.ProxmoxHostnameTagPrefix()),
+				proxmoxsource.WithVMZone(cfg.ProxmoxVMZone()),
 				proxmoxsource.WithTargetMode(proxmoxTargetMode(cfg)),
 				proxmoxsource.WithLogger(logger),
 			)
@@ -204,6 +205,7 @@ func registerSources(registry *source.Registry, cfg *config.Config, logger *slog
 			src := proxmoxsource.New(
 				proxmoxsource.WithDomain(cfg.ProxmoxDomainSuffix()),
 				proxmoxsource.WithHostnameTagPrefix(cfg.ProxmoxHostnameTagPrefix()),
+				proxmoxsource.WithVMZone(cfg.ProxmoxVMZone()),
 				proxmoxsource.WithTargetMode(proxmoxTargetMode(cfg)),
 				proxmoxsource.WithLogger(logger),
 			)

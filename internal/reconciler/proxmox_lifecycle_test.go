@@ -52,6 +52,7 @@ func newProxmoxDNSLifecycleReconciler(t *testing.T, lister *snapshotWorkloadList
 	sources := source.NewRegistry(quietLogger())
 	if err := sources.Register(proxmoxsource.New(
 		proxmoxsource.WithDomain("example.com"),
+		proxmoxsource.WithVMZone("example.com"),
 		proxmoxsource.WithLogger(quietLogger()),
 	)); err != nil {
 		t.Fatal(err)
@@ -67,11 +68,12 @@ func statefulProxmoxWorkload(id, name, node, vmid, ip string) workload.Workload 
 		Platform: workload.PlatformProxmox,
 		Kind:     workload.KindVM,
 		Metadata: map[string]string{
-			"node":                        node,
-			"vmid":                        vmid,
-			"ip":                          ip,
-			"proxmox.lifecycle.mode":      "stateful",
-			"proxmox.lifecycle.identity":  id,
+			"node":                           node,
+			"vmid":                           vmid,
+			"ip":                             ip,
+			"proxmox.lifecycle.mode":         "stateful",
+			"proxmox.lifecycle.identity":     id,
+			"proxmox.lifecycle.cluster_name": "test-cluster",
 		},
 	}
 }
@@ -199,6 +201,8 @@ func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resources = []proxmoxclient.ClusterResource{}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": resources})
+	case r.URL.Path == "/api2/json/cluster/status":
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []proxmoxclient.ClusterStatusEntry{{Type: "cluster", Name: "test-cluster"}}})
 	case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
 		if f.agentError {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -222,6 +226,11 @@ func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func newStatefulProxmoxDNSReconciler(t *testing.T, client *proxmoxclient.Client, stateFile string, extra func(*proxmoxclient.AdapterConfig)) (*Reconciler, *testMockProvider, *proxmoxclient.WorkloadListerAdapter) {
 	t.Helper()
 	backend := newTestMockProvider("dns")
+	return newStatefulProxmoxDNSReconcilerWithBackend(t, client, stateFile, backend, extra)
+}
+
+func newStatefulProxmoxDNSReconcilerWithBackend(t *testing.T, client *proxmoxclient.Client, stateFile string, backend *testMockProvider, extra func(*proxmoxclient.AdapterConfig)) (*Reconciler, *testMockProvider, *proxmoxclient.WorkloadListerAdapter) {
+	t.Helper()
 	providers := testProviderRegistry(quietLogger(), backend)
 	if err := providers.CreateInstance(provider.ProviderInstanceConfig{
 		Name:       "dns",
@@ -236,6 +245,7 @@ func newStatefulProxmoxDNSReconciler(t *testing.T, client *proxmoxclient.Client,
 	sources := source.NewRegistry(quietLogger())
 	if err := sources.Register(proxmoxsource.New(
 		proxmoxsource.WithDomain("example.com"),
+		proxmoxsource.WithVMZone("example.com"),
 		proxmoxsource.WithLogger(quietLogger()),
 	)); err != nil {
 		t.Fatal(err)
@@ -246,6 +256,7 @@ func newStatefulProxmoxDNSReconciler(t *testing.T, client *proxmoxclient.Client,
 		LifecycleScopeConfirmed:     true,
 		LifecycleDeleteObservations: 2,
 		DomainSuffix:                "example.com",
+		VMZone:                      "example.com",
 	}
 	if extra != nil {
 		extra(&adapterConfig)
@@ -305,8 +316,8 @@ func TestProxmoxStatefulLifecycleEndToEndRetainsAndCleansDNSSafely(t *testing.T)
 		t.Fatalf("initial reconcile: %v", err)
 	}
 	answers := dnsAnswerRecords(ctx, t, backend)
-	if len(answers) != 1 || answers[0].Target != "10.20.0.10" {
-		t.Fatalf("initial DNS answers = %+v, want one retained address", answers)
+	if len(answers) != 1 || answers[0].Target != "10.20.0.10" || answers[0].Hostname != "web.test-cluster.example.com" {
+		t.Fatalf("initial DNS answers = %+v, want web.test-cluster.example.com -> 10.20.0.10", answers)
 	}
 
 	fixture.agentError = true
@@ -348,7 +359,7 @@ func TestProxmoxStatefulLifecycleEndToEndRetainsAndCleansDNSSafely(t *testing.T)
 	// address is read from the durable lifecycle state after a restart.
 	fixture.resources[0].Status = "running"
 	fixture.agentError = true
-	r, backend, _ = newStatefulProxmoxDNSReconciler(t, client, stateFile, nil)
+	r, backend, _ = newStatefulProxmoxDNSReconcilerWithBackend(t, client, stateFile, backend, nil)
 	if _, err := r.Reconcile(ctx); err != nil {
 		t.Fatalf("restart reconcile: %v", err)
 	}
@@ -378,6 +389,92 @@ func TestProxmoxStatefulLifecycleEndToEndRetainsAndCleansDNSSafely(t *testing.T)
 	}
 	if answers = dnsAnswerRecords(ctx, t, backend); len(answers) != 0 {
 		t.Fatalf("VMID reuse inherited old DNS answer: %+v", answers)
+	}
+}
+
+func TestProxmoxStatefulLifecycleRestartCleansConfirmedDeleteFromStateAndOwnership(t *testing.T) {
+	fixture := &proxmoxDNSFixture{
+		resources: []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+		interfaces: []proxmoxclient.AgentNetworkInterface{{
+			Name:        "eth0",
+			IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.10"}},
+		}},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	stateFile := filepath.Join(t.TempDir(), "proxmox-lifecycle.json")
+	r, backend, _ := newStatefulProxmoxDNSReconciler(t, client, stateFile, nil)
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+
+	fixture.resources = nil
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("first absent observation: %v", err)
+	}
+	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 {
+		t.Fatalf("first absent observation removed DNS: %+v", answers)
+	}
+
+	// The new reconciler has no previousDesired or knownHostnames. Recovering
+	// provider ownership and reloading the lifecycle file must still allow the
+	// second confirmed absence to remove the old member.
+	restarted, backend, _ := newStatefulProxmoxDNSReconcilerWithBackend(t, client, stateFile, backend, nil)
+	if err := restarted.RecoverOwnership(ctx); err != nil {
+		t.Fatalf("recover ownership after restart: %v", err)
+	}
+	if _, err := restarted.Reconcile(ctx); err != nil {
+		t.Fatalf("confirmed absence after restart: %v", err)
+	}
+	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 0 {
+		t.Fatalf("confirmed deletion after restart left DNS: %+v", answers)
+	}
+}
+
+func TestProxmoxStatefulLifecycleAbsentPendingCollisionRemainsFrozen(t *testing.T) {
+	fixture := &proxmoxDNSFixture{
+		resources: []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+		interfaces: []proxmoxclient.AgentNetworkInterface{{
+			Name:        "eth0",
+			IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.10"}},
+		}},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	stateFile := filepath.Join(t.TempDir(), "proxmox-lifecycle.json")
+	r, backend, _ := newStatefulProxmoxDNSReconciler(t, client, stateFile, nil)
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+
+	fixture.resources = []proxmoxclient.ClusterResource{
+		{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"},
+		{VMID: 101, Name: "WEB", Node: "pve-01", Type: "qemu", Status: "running"},
+	}
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("collision reconcile: %v", err)
+	}
+	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 || answers[0].Target != "10.20.0.10" {
+		t.Fatalf("collision changed existing DNS: %+v", answers)
+	}
+
+	// One colliding identity disappears. It is absent-pending and is emitted
+	// with its retained address, so claims must keep the normalized name frozen.
+	fixture.resources = []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}}
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("absent-pending collision reconcile: %v", err)
+	}
+	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 || answers[0].Target != "10.20.0.10" {
+		t.Fatalf("absent-pending collision changed DNS: %+v", answers)
+	}
+
+	// The second complete absence observation confirms deletion; the surviving
+	// instance can then continue to own the name.
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("collision deletion confirmation: %v", err)
+	}
+	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 || answers[0].Target != "10.20.0.10" {
+		t.Fatalf("unfrozen surviving instance has wrong DNS: %+v", answers)
 	}
 }
 

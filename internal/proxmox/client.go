@@ -37,6 +37,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/maxfield-allison/dnsweaver/pkg/httputil"
@@ -167,6 +168,14 @@ type ClusterResourceSnapshot struct {
 	Resources  []ClusterResource
 	Complete   bool
 	ScopeClear bool
+}
+
+// ClusterStatusEntry is one entry returned by /cluster/status. The entry with
+// type "cluster" contains the stable PVE cluster name used in stateful DNS
+// naming. The endpoint host is deliberately not a substitute for this value.
+type ClusterStatusEntry struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
 }
 
 // LXCConfig holds the parsed configuration of a single LXC container.
@@ -313,6 +322,34 @@ func (c *Client) ListClusterResourceSnapshot(ctx context.Context) (ClusterResour
 		Complete:   true,
 		ScopeClear: true,
 	}, nil
+}
+
+// GetClusterName returns the actual cluster name reported by Proxmox.
+// Stateful naming must use this value rather than the API endpoint host.
+func (c *Client) GetClusterName(ctx context.Context) (string, error) {
+	var result struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := c.get(ctx, "/api2/json/cluster/status", &result); err != nil {
+		return "", fmt.Errorf("getting Proxmox cluster status: %w", err)
+	}
+	data := bytes.TrimSpace(result.Data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		return "", errors.New("Proxmox cluster status has no data")
+	}
+	var entries []ClusterStatusEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return "", fmt.Errorf("decoding Proxmox cluster status: %w", err)
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(strings.TrimSpace(entry.Type), "cluster") {
+			name := strings.TrimSpace(entry.Name)
+			if name != "" {
+				return name, nil
+			}
+		}
+	}
+	return "", errors.New("Proxmox cluster status did not contain a cluster name")
 }
 
 // GetLXCConfig returns the configuration of an LXC container.

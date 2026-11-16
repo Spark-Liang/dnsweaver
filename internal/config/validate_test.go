@@ -121,6 +121,19 @@ func TestValidateConfig_DuplicateProviderNames(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_StatefulRequiresVMZone(t *testing.T) {
+	cfg := &Config{Global: &GlobalConfig{
+		ProxmoxLifecycleMode:               "stateful",
+		ProxmoxLifecycleDeleteObservations: 2,
+	}}
+	for _, err := range validateConfig(cfg) {
+		if err.Field == "proxmox.vm_zone" {
+			return
+		}
+	}
+	t.Fatal("stateful configuration without VM zone was accepted")
+}
+
 func TestValidationError_SingleError(t *testing.T) {
 	err := &ValidationError{Errors: []*ConfigError{configErr("test_field", "single error message")}}
 	got := err.Error()

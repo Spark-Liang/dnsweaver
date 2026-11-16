@@ -17,18 +17,18 @@ const (
 	// LifecycleModeStateful enables persisted Proxmox lifecycle handling.
 	LifecycleModeStateful = "stateful"
 
-	DefaultLifecycleStateFile       = "proxmox-lifecycle.json"
+	DefaultLifecycleStateFile          = "proxmox-lifecycle.json"
 	DefaultLifecycleDeleteObservations = 2
 
-	LifecycleStateRunningAddress = "running+address"
-	LifecycleStateStopped        = "stopped"
-	LifecycleStateQGAUnavailable = "qga-unavailable"
-	LifecycleStateQGATimeout     = "qga-timeout"
-	LifecycleStateSuccessfulEmpty = "successful-empty"
+	LifecycleStateRunningAddress   = "running+address"
+	LifecycleStateStopped          = "stopped"
+	LifecycleStateQGAUnavailable   = "qga-unavailable"
+	LifecycleStateQGATimeout       = "qga-timeout"
+	LifecycleStateSuccessfulEmpty  = "successful-empty"
 	LifecycleStateInventoryUnknown = "inventory-unknown"
-	LifecycleStateAbsentPending  = "absent-pending"
-	LifecycleStateConfirmedAbsent = "confirmed-absent/deleted"
-	LifecycleStateNameCollision  = "name-collision"
+	LifecycleStateAbsentPending    = "absent-pending"
+	LifecycleStateConfirmedAbsent  = "confirmed-absent/deleted"
+	LifecycleStateNameCollision    = "name-collision"
 )
 
 const lifecycleSchemaVersion = 1
@@ -39,6 +39,7 @@ type lifecycleRecord struct {
 	Type                string       `json:"type"`
 	Name                string       `json:"name"`
 	Node                string       `json:"node"`
+	ClusterName         string       `json:"cluster_name,omitempty"`
 	Generation          uint64       `json:"generation"`
 	Status              string       `json:"status"`
 	Collision           bool         `json:"collision,omitempty"`
@@ -129,14 +130,15 @@ func (s *lifecycleStore) loadLocked() error {
 }
 
 func (s *lifecycleStore) saveLocked(file lifecycleFile) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating proxmox lifecycle state directory: %w", err)
 	}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding proxmox lifecycle state: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".proxmox-lifecycle-*.tmp")
+	tmp, err := os.CreateTemp(dir, ".proxmox-lifecycle-*.tmp")
 	if err != nil {
 		return fmt.Errorf("creating proxmox lifecycle state temporary file: %w", err)
 	}
@@ -159,6 +161,17 @@ func (s *lifecycleStore) saveLocked(file lifecycleFile) error {
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("replacing proxmox lifecycle state: %w", err)
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("opening proxmox lifecycle state directory for sync: %w", err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return fmt.Errorf("syncing proxmox lifecycle state directory: %w", err)
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("closing proxmox lifecycle state directory: %w", err)
 	}
 	return nil
 }
@@ -185,5 +198,6 @@ func clusterIdentity(raw string) string {
 }
 
 func lifecycleIdentity(cluster string, resource ClusterResource) string {
+	cluster = strings.ToLower(strings.Trim(strings.TrimSpace(cluster), "."))
 	return fmt.Sprintf("%s|%s|%d", cluster, resource.Type, resource.VMID)
 }
