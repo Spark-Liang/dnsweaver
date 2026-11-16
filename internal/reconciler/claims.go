@@ -11,17 +11,20 @@ import (
 )
 
 type extractedClaims struct {
-	Claims   []*source.Hostname
-	Unique   map[string]*source.Hostname
-	Complete bool
+	Claims        []*source.Hostname
+	Unique        map[string]*source.Hostname
+	Complete      bool
+	BlockedNames  map[string]struct{}
 }
 
 func (r *Reconciler) extractClaims(ctx context.Context, workloads []workload.Workload, result *Result) extractedClaims {
 	extracted := extractedClaims{
-		Unique:   make(map[string]*source.Hostname),
-		Complete: true,
+		Unique:       make(map[string]*source.Hostname),
+		Complete:     true,
+		BlockedNames: make(map[string]struct{}),
 	}
 	origins := make(map[string]string)
+	proxmoxOrigins := make(map[string]string)
 	reportedDuplicates := make(map[string]struct{})
 
 	for _, currentWorkload := range workloads {
@@ -33,6 +36,18 @@ func (r *Reconciler) extractClaims(ctx context.Context, workloads []workload.Wor
 		selected := selectClaimsWithinWorkload(valid)
 		for _, claim := range selected {
 			normalized := claim.NormalizedName()
+			if isStatefulProxmoxWorkload(currentWorkload) {
+				if firstID, exists := proxmoxOrigins[normalized]; exists && firstID != currentWorkload.ID {
+					extracted.BlockedNames[normalized] = struct{}{}
+					r.logger.Error("freezing Proxmox DNS name after lifecycle identity collision",
+						slog.String("hostname", claim.Name),
+						slog.String("first_identity", firstID),
+						slog.String("colliding_identity", currentWorkload.ID),
+					)
+				} else if !exists {
+					proxmoxOrigins[normalized] = currentWorkload.ID
+				}
+			}
 			if firstWorkload, exists := origins[normalized]; exists && firstWorkload != currentWorkload.Name {
 				duplicateKey := normalized + "\x00" + currentWorkload.Name
 				if _, reported := reportedDuplicates[duplicateKey]; !reported {
@@ -63,6 +78,10 @@ func (r *Reconciler) extractClaims(ctx context.Context, workloads []workload.Wor
 	}
 
 	return extracted
+}
+
+func isStatefulProxmoxWorkload(w workload.Workload) bool {
+	return w.Platform.IsProxmox() && w.Metadata["proxmox.lifecycle.mode"] == "stateful"
 }
 
 func (r *Reconciler) validateClaims(hostnames source.Hostnames, workloadName string, fromFile bool, result *Result) source.Hostnames {

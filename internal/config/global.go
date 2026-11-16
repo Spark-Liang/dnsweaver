@@ -37,6 +37,10 @@ const (
 	DefaultSource               = "traefik"
 	DefaultInstanceID           = ""
 	DefaultPlatform             = "docker"
+	DefaultProxmoxLifecycleMode = "legacy"
+	DefaultProxmoxLifecycleStateFile = "proxmox-lifecycle.json"
+	DefaultProxmoxLifecycleScopeConfirmed = false
+	DefaultProxmoxLifecycleDeleteObservations = 2
 )
 
 // InstanceID validation constraints.
@@ -105,6 +109,10 @@ type GlobalConfig struct {
 	ProxmoxVerifyTLS          bool     // Verify TLS certificate on PVE API endpoint (DEPRECATED in v1.5: prefer ProxmoxTLSSkipVerify)
 	ProxmoxTargetMode         string   // Target resolution mode: "guest-ip" (default) or "instance"
 	ProxmoxIPVersion          string   // Address families to resolve: "ipv4" (default), "ipv6", or "dual"
+	ProxmoxLifecycleMode      string   // "legacy" (default) or "stateful"
+	ProxmoxLifecycleStateFile string   // Persisted state path for stateful mode
+	ProxmoxLifecycleScopeConfirmed bool // Explicitly confirm complete PVE inventory scope
+	ProxmoxLifecycleDeleteObservations int // Consecutive absent snapshots before deletion
 
 	// Unified PVE TLS configuration (v1.5+). Populated from DNSWEAVER_PROXMOX_TLS_*
 	// env vars and consumed by internal/proxmox via httputil.TLSConfig.
@@ -473,6 +481,7 @@ func loadGlobalConfig() (*GlobalConfig, []*ConfigError) {
 			))
 		}
 	}
+	applyProxmoxLifecycleEnv(cfg, &errs)
 	if v := getEnv("DNSWEAVER_PROXMOX_VERIFY_TLS"); v != "" {
 		cfg.ProxmoxVerifyTLS = parseBool(v, false)
 	}
@@ -550,6 +559,63 @@ func loadGlobalConfig() (*GlobalConfig, []*ConfigError) {
 	cfg.IncusCertStore = getEnv("DNSWEAVER_INCUS_CERT_STORE")
 
 	return cfg, errs
+}
+
+// applyProxmoxLifecycleEnv applies the fork's opt-in lifecycle controls to
+// either an environment-only or file-derived GlobalConfig.
+func applyProxmoxLifecycleEnv(cfg *GlobalConfig, errs *[]*ConfigError) {
+	if cfg.ProxmoxLifecycleMode == "" {
+		cfg.ProxmoxLifecycleMode = DefaultProxmoxLifecycleMode
+	}
+	if cfg.ProxmoxLifecycleStateFile == "" {
+		cfg.ProxmoxLifecycleStateFile = DefaultProxmoxLifecycleStateFile
+	}
+	if cfg.ProxmoxLifecycleDeleteObservations == 0 {
+		cfg.ProxmoxLifecycleDeleteObservations = DefaultProxmoxLifecycleDeleteObservations
+	}
+
+	if v := getEnv("DNSWEAVER_PROXMOX_LIFECYCLE_MODE"); v != "" {
+		cfg.ProxmoxLifecycleMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := getEnv("DNSWEAVER_PROXMOX_LIFECYCLE_STATE_FILE"); v != "" {
+		cfg.ProxmoxLifecycleStateFile = v
+	}
+	if v := getEnv("DNSWEAVER_PROXMOX_LIFECYCLE_SCOPE_CONFIRMED"); v != "" {
+		if value, ok := parseBoolValue(v); ok {
+			cfg.ProxmoxLifecycleScopeConfirmed = value
+		} else {
+			*errs = append(*errs, configErrFull(
+				"DNSWEAVER_PROXMOX_LIFECYCLE_SCOPE_CONFIRMED",
+				fmt.Sprintf("invalid boolean %q", v),
+				"Must be true or false; set true only when the PVE inventory scope is complete",
+				"DNSWEAVER_PROXMOX_LIFECYCLE_SCOPE_CONFIRMED=false",
+			))
+		}
+	}
+	if v := getEnv("DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS"); v != "" {
+		if observations, err := parseIntEnv(v); err == nil && observations >= 1 {
+			cfg.ProxmoxLifecycleDeleteObservations = observations
+		} else {
+			*errs = append(*errs, configErrFull(
+				"DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS",
+				fmt.Sprintf("invalid value %q", v),
+				"Must be a positive integer; each complete absent inventory is one observation",
+				"DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS=2",
+			))
+		}
+	}
+
+	switch cfg.ProxmoxLifecycleMode {
+	case DefaultProxmoxLifecycleMode, "stateful":
+		// valid
+	default:
+		*errs = append(*errs, configErrFull(
+			"DNSWEAVER_PROXMOX_LIFECYCLE_MODE",
+			fmt.Sprintf("invalid value %q", cfg.ProxmoxLifecycleMode),
+			"Must be one of: legacy (default), stateful",
+			"DNSWEAVER_PROXMOX_LIFECYCLE_MODE=stateful",
+		))
+	}
 }
 
 func healthListenerFromEnvironment(fallbackAddress string, fallbackAllowNetwork bool) (string, bool, []*ConfigError) {

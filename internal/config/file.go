@@ -34,6 +34,10 @@ type FileConfig struct {
 	// Kubernetes watcher settings
 	Kubernetes *FileKubernetesConfig `yaml:"kubernetes,omitempty"`
 
+	// Proxmox lifecycle settings. These are opt-in and leave legacy behavior
+	// unchanged when omitted.
+	Proxmox *FileProxmoxConfig `yaml:"proxmox,omitempty"`
+
 	// Hostname sources
 	Sources []FileSourceConfig `yaml:"sources,omitempty"`
 
@@ -90,6 +94,14 @@ type FileKubernetesConfig struct {
 	WatchServices     *bool    `yaml:"watch_services,omitempty"`     // Watch Service resources (default: false)
 	LabelSelector     string   `yaml:"label_selector,omitempty"`     // Label selector filter
 	AnnotationFilter  string   `yaml:"annotation_filter,omitempty"`  // Annotation key=value filter
+}
+
+// FileProxmoxConfig holds the fork's opt-in lifecycle controls.
+type FileProxmoxConfig struct {
+	LifecycleMode              string `yaml:"lifecycle_mode,omitempty"`
+	LifecycleStateFile         string `yaml:"lifecycle_state_file,omitempty"`
+	LifecycleScopeConfirmed    *bool  `yaml:"lifecycle_scope_confirmed,omitempty"`
+	LifecycleDeleteObservations *int  `yaml:"lifecycle_delete_observations,omitempty"`
 }
 
 // FileSourceConfig holds configuration for a hostname source.
@@ -176,6 +188,10 @@ func (c *FileConfig) interpolateEnvVars() {
 	if c.Docker != nil {
 		c.Docker.Host = InterpolateEnvVars(c.Docker.Host)
 		c.Docker.Mode = InterpolateEnvVars(c.Docker.Mode)
+	}
+	if c.Proxmox != nil {
+		c.Proxmox.LifecycleMode = InterpolateEnvVars(c.Proxmox.LifecycleMode)
+		c.Proxmox.LifecycleStateFile = InterpolateEnvVars(c.Proxmox.LifecycleStateFile)
 	}
 
 	if c.Kubernetes != nil {
@@ -278,6 +294,10 @@ func (c *FileConfig) ToGlobalConfig() *GlobalConfig {
 		K8sWatchHTTPRoute:    true,
 		K8sWatchServices:     false,
 		Source:               DefaultSource,
+		ProxmoxLifecycleMode: DefaultProxmoxLifecycleMode,
+		ProxmoxLifecycleStateFile: DefaultProxmoxLifecycleStateFile,
+		ProxmoxLifecycleScopeConfirmed: DefaultProxmoxLifecycleScopeConfirmed,
+		ProxmoxLifecycleDeleteObservations: DefaultProxmoxLifecycleDeleteObservations,
 	}
 
 	if c.Logging != nil {
@@ -357,6 +377,21 @@ func (c *FileConfig) ToGlobalConfig() *GlobalConfig {
 			if timeout, err := time.ParseDuration(c.Docker.ConnectTimeout); err == nil && timeout >= 0 {
 				cfg.DockerConnectTimeout = timeout
 			}
+		}
+	}
+
+	if c.Proxmox != nil {
+		if c.Proxmox.LifecycleMode != "" {
+			cfg.ProxmoxLifecycleMode = strings.ToLower(strings.TrimSpace(c.Proxmox.LifecycleMode))
+		}
+		if c.Proxmox.LifecycleStateFile != "" {
+			cfg.ProxmoxLifecycleStateFile = c.Proxmox.LifecycleStateFile
+		}
+		if c.Proxmox.LifecycleScopeConfirmed != nil {
+			cfg.ProxmoxLifecycleScopeConfirmed = *c.Proxmox.LifecycleScopeConfirmed
+		}
+		if c.Proxmox.LifecycleDeleteObservations != nil {
+			cfg.ProxmoxLifecycleDeleteObservations = *c.Proxmox.LifecycleDeleteObservations
 		}
 	}
 

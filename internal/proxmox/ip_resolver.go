@@ -42,6 +42,17 @@ type ResolveOptions struct {
 	// WantV6 enables IPv6 resolution. When false the resolver skips the extra
 	// work and the LXC interfaces fallback is only consulted for a missing V4.
 	WantV6 bool
+
+	// StrictInterfaceSelection prevents a configured preference or allow-list
+	// from falling back to an arbitrary interface. Legacy callers keep the
+	// historical fallback when this is false; the stateful lifecycle adapter
+	// enables it so an unqualified NIC cannot replace a last-confirmed address.
+	StrictInterfaceSelection bool
+
+	// PreserveTransientErrors lets callers distinguish QGA unavailable and
+	// timeout outcomes from a successful empty address response. The legacy
+	// resolver contract continues to return an empty result for QGA absence.
+	PreserveTransientErrors bool
 }
 
 // ResolveIP returns the primary IPv4 address for a Proxmox resource.
@@ -227,6 +238,9 @@ func resolveVMIPs(ctx context.Context, client *Client, resource ClusterResource,
 				slog.Int("vmid", resource.VMID),
 				slog.String("name", resource.Name),
 			)
+			if opts.PreserveTransientErrors {
+				return ResolvedIPs{}, err
+			}
 			return ResolvedIPs{}, nil
 		}
 		return ResolvedIPs{}, fmt.Errorf("querying guest agent for VM %d on %s: %w", resource.VMID, resource.Node, err)
@@ -281,10 +295,12 @@ func assignAddress(out *ResolvedIPs, addr string, wantV6 bool) {
 
 // interfaceOrder returns indices into names in the order they should be
 // considered: the preferred interface first, then allow-listed interfaces in
-// allow-list order, then everything else as a fallback.
+// allow-list order, then everything else as a fallback unless strict selection
+// was requested.
 //
-// Every interface stays in the list so a guest whose allow-listed NIC has no
-// usable address still resolves, matching the documented fallback behavior.
+// Legacy callers keep every interface in the list so a guest whose allow-listed
+// NIC has no usable address still resolves. Stateful callers can request strict
+// selection to omit that fallback.
 func interfaceOrder(names []string, opts ResolveOptions) []int {
 	order := make([]int, 0, len(names))
 	seen := make(map[int]bool, len(names))
@@ -313,6 +329,10 @@ func interfaceOrder(names []string, opts ResolveOptions) []int {
 				break
 			}
 		}
+	}
+
+	if opts.StrictInterfaceSelection && (opts.InterfacePreference != "" || len(opts.AllowedInterfaces) > 0) {
+		return order
 	}
 
 	for i := range names {

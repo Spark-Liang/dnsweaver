@@ -229,6 +229,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 
 	// Step 1: List all workloads from all platform listers
 	var allWorkloads []workload.Workload
+	blockedSnapshotNames := make(map[string]struct{})
+	snapshotSafe := true
 	for _, lister := range r.listers {
 		workloads, err := lister.ListWorkloads(ctx)
 		if err != nil {
@@ -239,6 +241,15 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 			slog.Int("count", len(workloads)),
 		)
 		allWorkloads = append(allWorkloads, workloads...)
+		if statusProvider, ok := lister.(workload.SnapshotStatusProvider); ok {
+			status := statusProvider.SnapshotStatus()
+			if !status.Complete || !status.AllowOrphanCleanup {
+				snapshotSafe = false
+			}
+			for _, hostname := range status.BlockedHostnames {
+				blockedSnapshotNames[hostname] = struct{}{}
+			}
+		}
 	}
 	result.WorkloadsScanned = len(allWorkloads)
 
@@ -272,6 +283,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 	// desired sets so removed routes and post-restart orphans are handled by the
 	// same exact-member diff.
 	compiled := r.compileDesiredRecordSets(extracted.Claims)
+	compiled.BlockedNames = make(map[string]struct{}, len(extracted.BlockedNames)+len(blockedSnapshotNames))
+	for hostname := range extracted.BlockedNames {
+		compiled.BlockedNames[hostname] = struct{}{}
+	}
+	for hostname := range blockedSnapshotNames {
+		compiled.BlockedNames[hostname] = struct{}{}
+	}
 	result.DesiredMembers = desiredMemberCount(compiled)
 	for _, action := range compiled.Skipped {
 		result.AddAction(action)
@@ -290,7 +308,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 	for key, prior := range previous {
 		nextPrevious[key] = prior
 	}
-	complete := extracted.Complete && compiled.RoutingComplete
+	complete := extracted.Complete && compiled.RoutingComplete && snapshotSafe
 	// A destination that could not be read cannot establish a safe route move.
 	// Preserve the old route until every provider snapshot is available.
 	for _, instance := range r.providers.All() {
@@ -309,6 +327,19 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		failedDestinations[name.Hostname] = true
 	}
 	for _, set := range sets {
+		if _, blocked := compiled.BlockedNames[set.Key.Hostname]; blocked {
+			result.AddAction(Action{
+				Type:       ActionSkip,
+				Provider:   set.Instance.Name(),
+				Hostname:   set.Key.Hostname,
+				RecordType: string(set.Key.RecordType),
+				Target:     set.Instance.EffectiveTarget(),
+				Status:     StatusSkipped,
+				Error:      "Proxmox lifecycle name collision; DNS name frozen",
+			})
+			failedDestinations[set.Key.Hostname] = true
+			continue
+		}
 		replacement := replacementKey{set.Key.Identity, set.Key.Hostname}
 		if blockedReplacements[replacement] {
 			failedDestinations[set.Key.Hostname] = true

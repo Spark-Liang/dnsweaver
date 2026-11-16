@@ -32,6 +32,7 @@ type desiredCompilation struct {
 	Sets              []*desiredRecordSet
 	Skipped           []Action
 	HostnameProviders map[string][]string
+	BlockedNames      map[string]struct{}
 	// RejectedNames are backend names whose desired record types contradict
 	// each other. Nothing at those names may be written or retired this cycle.
 	RejectedNames map[replacementKey]struct{}

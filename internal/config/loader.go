@@ -294,6 +294,8 @@ func mergeGlobalConfig(base *GlobalConfig) (*GlobalConfig, []*ConfigError) {
 		}
 	}
 
+	applyProxmoxLifecycleEnv(&cfg, &errs)
+
 	// Override Kubernetes settings if set in env
 	if v := getEnv("DNSWEAVER_K8S_KUBECONFIG"); v != "" {
 		cfg.K8sKubeconfig = v

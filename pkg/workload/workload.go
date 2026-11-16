@@ -154,6 +154,26 @@ type Workload struct {
 	Metadata map[string]string
 }
 
+// SnapshotStatus describes whether a lister returned a complete inventory and
+// whether it is safe for the reconciler to remove records that are absent from
+// this snapshot. Listers that do not implement SnapshotStatusProvider retain
+// the historical reconciler behavior.
+type SnapshotStatus struct {
+	Complete           bool
+	AllowOrphanCleanup bool
+	// BlockedHostnames are normalized DNS names whose automatic writes and
+	// removals must be held for this cycle (for example, a Proxmox name
+	// collision). This is intentionally optional and platform-agnostic.
+	BlockedHostnames []string
+}
+
+// SnapshotStatusProvider is an optional lister capability used by sources
+// whose inventory can distinguish a complete snapshot from a transient or
+// incomplete observation.
+type SnapshotStatusProvider interface {
+	SnapshotStatus() SnapshotStatus
+}
+
 // String returns a human-readable representation of the workload.
 func (w Workload) String() string {
 	return string(w.Platform) + "/" + string(w.Kind) + ":" + w.Name

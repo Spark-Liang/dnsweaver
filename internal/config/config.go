@@ -385,6 +385,29 @@ func (c *Config) ProxmoxIPVersion() string {
 	return c.Global.ProxmoxIPVersion
 }
 
+// ProxmoxLifecycleMode returns "legacy" (the default) or "stateful".
+func (c *Config) ProxmoxLifecycleMode() string {
+	return c.Global.ProxmoxLifecycleMode
+}
+
+// ProxmoxLifecycleStateFile returns the persisted state path used by stateful
+// Proxmox lifecycle handling.
+func (c *Config) ProxmoxLifecycleStateFile() string {
+	return c.Global.ProxmoxLifecycleStateFile
+}
+
+// ProxmoxLifecycleScopeConfirmed reports whether the operator explicitly
+// confirmed that the configured PVE account sees the complete VM scope.
+func (c *Config) ProxmoxLifecycleScopeConfirmed() bool {
+	return c.Global.ProxmoxLifecycleScopeConfirmed
+}
+
+// ProxmoxLifecycleDeleteObservations returns the consecutive complete absent
+// inventory observations required before deletion.
+func (c *Config) ProxmoxLifecycleDeleteObservations() int {
+	return c.Global.ProxmoxLifecycleDeleteObservations
+}
+
 // ProxmoxVerifyTLS returns whether to verify TLS on the PVE API endpoint.
 //
 // Deprecated: prefer ProxmoxTLS().InsecureSkip (inverted polarity). Retained

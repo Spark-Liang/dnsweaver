@@ -26,6 +26,7 @@
 package proxmox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -159,6 +160,15 @@ type ClusterResource struct {
 	Pool string `json:"pool"`
 }
 
+// ClusterResourceSnapshot is the result of a cluster resource inventory
+// request. Complete is false when PVE returned a null or missing data payload;
+// such a response cannot establish that resources are absent.
+type ClusterResourceSnapshot struct {
+	Resources  []ClusterResource
+	Complete   bool
+	ScopeClear bool
+}
+
 // LXCConfig holds the parsed configuration of a single LXC container.
 // Only fields relevant to IP resolution are populated.
 type LXCConfig struct {
@@ -270,15 +280,39 @@ type AgentIPAddress struct {
 // ListClusterResources returns all QEMU VMs and LXC containers in the cluster.
 // Works on both standalone nodes and full cluster configurations.
 func (c *Client) ListClusterResources(ctx context.Context) ([]ClusterResource, error) {
+	snapshot, err := c.ListClusterResourceSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Resources, nil
+}
+
+// ListClusterResourceSnapshot returns the cluster resource inventory together
+// with the completeness signal needed by the stateful lifecycle adapter.
+// PVE's cluster/resources endpoint is not paginated in this client; a JSON
+// array is therefore a complete response for the requested VM scope, while a
+// null or missing data payload is an unknown snapshot.
+func (c *Client) ListClusterResourceSnapshot(ctx context.Context) (ClusterResourceSnapshot, error) {
 	var result struct {
-		Data []ClusterResource `json:"data"`
+		Data json.RawMessage `json:"data"`
 	}
 
 	if err := c.get(ctx, "/api2/json/cluster/resources?type=vm", &result); err != nil {
-		return nil, fmt.Errorf("listing cluster resources: %w", err)
+		return ClusterResourceSnapshot{}, fmt.Errorf("listing cluster resources: %w", err)
+	}
+	if len(bytes.TrimSpace(result.Data)) == 0 || bytes.Equal(bytes.TrimSpace(result.Data), []byte("null")) {
+		return ClusterResourceSnapshot{}, nil
 	}
 
-	return result.Data, nil
+	var resources []ClusterResource
+	if err := json.Unmarshal(result.Data, &resources); err != nil {
+		return ClusterResourceSnapshot{}, fmt.Errorf("decoding cluster resource data: %w", err)
+	}
+	return ClusterResourceSnapshot{
+		Resources:  resources,
+		Complete:   true,
+		ScopeClear: true,
+	}, nil
 }
 
 // GetLXCConfig returns the configuration of an LXC container.
@@ -351,6 +385,13 @@ func (c *Client) GetVMAgentNetworks(ctx context.Context, node string, vmid int) 
 	}
 
 	return result.Data.Result, nil
+}
+
+// ClusterIdentity returns a credential-free identity for the configured PVE
+// endpoint. It intentionally excludes the node so VM migration keeps the same
+// lifecycle identity.
+func (c *Client) ClusterIdentity() string {
+	return clusterIdentity(c.baseURL)
 }
 
 // ErrAgentNotRunning is returned when the qemu-guest-agent is not available on a VM.

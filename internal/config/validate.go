@@ -69,6 +69,28 @@ func validateConfig(cfg *Config) []*ConfigError {
 		))
 	}
 
+	switch cfg.Global.ProxmoxLifecycleMode {
+	case DefaultProxmoxLifecycleMode, "stateful":
+		// Valid.
+	case "":
+		// Direct unit-test configurations may omit newly added optional fields.
+	default:
+		errs = append(errs, configErrFull(
+			"proxmox.lifecycle_mode",
+			fmt.Sprintf("invalid value %q", cfg.Global.ProxmoxLifecycleMode),
+			"Must be one of: legacy (default), stateful",
+			"DNSWEAVER_PROXMOX_LIFECYCLE_MODE=stateful",
+		))
+	}
+	if cfg.Global.ProxmoxLifecycleDeleteObservations < 0 {
+		errs = append(errs, configErrFull(
+			"proxmox.lifecycle_delete_observations",
+			"must be at least 1",
+			"Each complete absent inventory is one deletion observation",
+			"DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS=2",
+		))
+	}
+
 	// Validate provider names are unique
 	seen := make(map[string]bool)
 	for _, inst := range cfg.ProviderInstances {
