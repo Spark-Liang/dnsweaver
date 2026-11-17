@@ -165,7 +165,11 @@ func NewWorkloadListerAdapter(c *Client, cfg AdapterConfig, logger *slog.Logger)
 	} else if strings.TrimSpace(stateFilter) == "" {
 		stateFilter = stateRunning
 	}
-	snapshot := workload.SnapshotStatus{Complete: true, AllowOrphanCleanup: true}
+	snapshot := workload.SnapshotStatus{
+		Complete:           true,
+		AllowOrphanCleanup: true,
+		StatefulProxmox:    lifecycleMode == LifecycleModeStateful,
+	}
 	var store *lifecycleStore
 	if lifecycleMode == LifecycleModeStateful && c != nil {
 		store = newLifecycleStore(stateFile)
@@ -247,6 +251,7 @@ func (a *WorkloadListerAdapter) SnapshotStatus() workload.SnapshotStatus {
 }
 
 func (a *WorkloadListerAdapter) setSnapshot(status workload.SnapshotStatus) {
+	status.StatefulProxmox = a.cfg.LifecycleMode == LifecycleModeStateful
 	a.snapshotMu.Lock()
 	a.snapshot = status
 	a.snapshotMu.Unlock()

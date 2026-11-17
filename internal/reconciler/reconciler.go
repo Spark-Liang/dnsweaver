@@ -232,6 +232,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 	blockedSnapshotNames := make(map[string]struct{})
 	snapshotComplete := true
 	snapshotScopeConfirmed := true
+	statefulProxmoxSnapshot := false
 	for _, lister := range r.listers {
 		workloads, err := lister.ListWorkloads(ctx)
 		if err != nil {
@@ -244,6 +245,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		allWorkloads = append(allWorkloads, workloads...)
 		if statusProvider, ok := lister.(workload.SnapshotStatusProvider); ok {
 			status := statusProvider.SnapshotStatus()
+			statefulProxmoxSnapshot = statefulProxmoxSnapshot || status.StatefulProxmox
 			if !status.Complete {
 				snapshotComplete = false
 			}
@@ -288,6 +290,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		compiled.BlockedNames[source.NormalizeHostname(hostname)] = struct{}{}
 	}
 	preflightNames := len(compiled.BlockedNames) > 0 || len(extracted.StatefulClaims) > 0 ||
+		statefulProxmoxSnapshot || r.hasStatefulPreviousDesired() ||
 		r.hasStatefulPendingOwnershipRepairs() || r.hasStatefulPendingReplacementRecoveries()
 	var cache *recordCache
 	if preflightNames {
@@ -435,8 +438,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 				delete(nextPrevious, set.Key)
 			} else {
 				nextPrevious[set.Key] = previousDesiredSet{
-					ProviderName: set.Instance.Name(),
-					Records:      managed,
+					ProviderName:    set.Instance.Name(),
+					Records:         managed,
+					StatefulProxmox: hasStatefulProxmoxMember(set),
 				}
 			}
 		}

@@ -21,6 +21,59 @@ const companionHTTPSTargetName = "."
 
 const companionStateKey = "technitium.companion_https"
 const protectedCompanionState = "protected"
+const companionOwnershipMetadataKey = "dnsweaver.related.technitium-https"
+
+func (p *Provider) AddRelatedOwnershipMetadata(metadata map[string]string, related []provider.Record) map[string]string {
+	for _, record := range related {
+		if record.Type != provider.RecordTypeHTTPS || record.HTTPS == nil {
+			continue
+		}
+		if metadata == nil {
+			metadata = make(map[string]string)
+		} else {
+			metadata = cloneMetadata(metadata)
+		}
+		metadata[companionOwnershipMetadataKey] = "true"
+		return metadata
+	}
+	return metadata
+}
+
+func (p *Provider) MergeRelatedOwnershipMetadata(metadata, previous map[string]string) map[string]string {
+	if previous[companionOwnershipMetadataKey] != "true" {
+		return metadata
+	}
+	metadata = cloneMetadata(metadata)
+	metadata[companionOwnershipMetadataKey] = "true"
+	return metadata
+}
+
+func (p *Provider) OwnsRelatedRecord(parent, related provider.Record, metadata map[string]string) bool {
+	if metadata[companionOwnershipMetadataKey] != "true" ||
+		(parent.Type != provider.RecordTypeA && parent.Type != provider.RecordTypeAAAA) ||
+		related.Type != provider.RecordTypeHTTPS || related.HTTPS == nil ||
+		!strings.EqualFold(strings.TrimSuffix(parent.Hostname, "."), strings.TrimSuffix(related.Hostname, ".")) ||
+		related.HTTPS.Priority != companionHTTPSSvcPriority || related.HTTPS.TargetName != companionHTTPSTargetName || related.HTTPS.ALPN == "" ||
+		parent.Metadata[companionStateKey] == protectedCompanionState {
+		return false
+	}
+	state, known := parent.Metadata[companionStateKey]
+	if !known {
+		return false
+	}
+	return state == strconv.Itoa(related.TTL)+":"+buildSvcParams(related.HTTPS.ALPN)
+}
+
+func cloneMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return make(map[string]string)
+	}
+	cloned := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
 
 // companionHTTPS identifies only the format dnsweaver generates. Multiple,
 // disabled or customized HTTPS records are left under their existing control.
@@ -106,33 +159,38 @@ func hadCompanionHTTPS(recordType provider.RecordType) bool {
 // An existing record matching the generated format is reconciled with the
 // configured ALPN and TTL. Callers must hold management authority for the parent.
 func (p *Provider) createCompanionHTTPS(ctx context.Context, hostname string, recordType provider.RecordType, ttl int) error {
+	_, _, err := p.createCompanionHTTPSWithResult(ctx, hostname, recordType, ttl)
+	return err
+}
+
+func (p *Provider) createCompanionHTTPSWithResult(ctx context.Context, hostname string, recordType provider.RecordType, ttl int) (provider.Record, bool, error) {
 	if !p.autoHTTPSRecords {
-		return nil
+		return provider.Record{}, false, nil
 	}
 	if !needsCompanionHTTPS(recordType) {
-		return nil
+		return provider.Record{}, false, nil
 	}
 
 	// Re-read before mutation so a stale snapshot cannot overwrite a newly
 	// customized or ambiguous HTTPS RRset.
 	records, err := p.client.GetRecords(ctx, p.zone, hostname)
 	if err != nil {
-		return fmt.Errorf("checking companion HTTPS record for %s: %w", hostname, err)
+		return provider.Record{}, false, fmt.Errorf("checking companion HTTPS record for %s: %w", hostname, err)
 	}
 	existing, protected := companionHTTPS(records, hostname)
 	if protected {
 		p.logger.Debug("custom HTTPS records exist, skipping companion reconciliation",
 			slog.String("hostname", hostname),
 		)
-		return nil
+		return provider.Record{}, false, nil
 	}
 
 	svcParams := buildSvcParams(p.autoHTTPSALPN)
 	if existing != nil {
 		if existing.TTL == ttl && string(existing.RData.SvcParams) == svcParams {
-			return nil
+			return provider.Record{}, false, nil
 		}
-		return p.client.UpdateHTTPSRecord(ctx, p.zone, *existing, apiRecord{
+		return provider.Record{}, false, p.client.UpdateHTTPSRecord(ctx, p.zone, *existing, apiRecord{
 			Name: hostname, Type: "HTTPS", TTL: ttl,
 			RData: apiRData{SvcPriority: companionHTTPSSvcPriority, SvcTargetName: companionHTTPSTargetName, SvcParams: svcParamsValue(svcParams)},
 		})
@@ -141,9 +199,9 @@ func (p *Provider) createCompanionHTTPS(ctx context.Context, hostname string, re
 		// If Technitium reports conflict, treat as non-fatal (record already exists)
 		if strings.Contains(err.Error(), "record already exists") || strings.Contains(err.Error(), "Identical record") {
 			p.logger.Debug("companion HTTPS record already exists (conflict)", slog.String("hostname", hostname))
-			return nil
+			return provider.Record{}, false, nil
 		}
-		return fmt.Errorf("creating companion HTTPS record for %s: %w", hostname, err)
+		return provider.Record{}, false, fmt.Errorf("creating companion HTTPS record for %s: %w", hostname, err)
 	}
 
 	p.logger.Info("created companion HTTPS record",
@@ -152,7 +210,17 @@ func (p *Provider) createCompanionHTTPS(ctx context.Context, hostname string, re
 		slog.Int("ttl", ttl),
 	)
 
-	return nil
+	return provider.Record{
+		Hostname: hostname,
+		Type:     provider.RecordTypeHTTPS,
+		Target:   companionHTTPSTargetName,
+		TTL:      ttl,
+		HTTPS: &provider.HTTPSData{
+			Priority:   companionHTTPSSvcPriority,
+			TargetName: companionHTTPSTargetName,
+			ALPN:       p.autoHTTPSALPN,
+		},
+	}, true, nil
 }
 
 // deleteCompanionHTTPS removes the companion HTTPS record for the given hostname.

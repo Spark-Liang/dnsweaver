@@ -276,6 +276,13 @@ func (p *Provider) ListUnmanagedRecords(ctx context.Context) ([]provider.Record,
 
 // Create adds a new DNS record.
 func (p *Provider) Create(ctx context.Context, record provider.Record) error {
+	_, err := p.CreateWithRelatedRecords(ctx, record)
+	return err
+}
+
+// CreateWithRelatedRecords returns only companion records created by this
+// operation. Existing records with the same shape are never adopted as owned.
+func (p *Provider) CreateWithRelatedRecords(ctx context.Context, record provider.Record) ([]provider.Record, error) {
 	ttl := record.TTL
 	if ttl <= 0 {
 		ttl = p.ttl
@@ -284,37 +291,37 @@ func (p *Provider) Create(ctx context.Context, record provider.Record) error {
 	switch record.Type {
 	case provider.RecordTypeA:
 		if err := p.client.AddARecord(ctx, p.zone, record.Hostname, record.Target, ttl); err != nil {
-			return fmt.Errorf("creating A record: %w", err)
+			return nil, fmt.Errorf("creating A record: %w", err)
 		}
 	case provider.RecordTypeAAAA:
 		if err := p.client.AddAAAARecord(ctx, p.zone, record.Hostname, record.Target, ttl); err != nil {
-			return fmt.Errorf("creating AAAA record: %w", err)
+			return nil, fmt.Errorf("creating AAAA record: %w", err)
 		}
 	case provider.RecordTypeCNAME:
 		if err := p.client.AddCNAMERecord(ctx, p.zone, record.Hostname, record.Target, ttl); err != nil {
-			return fmt.Errorf("creating CNAME record: %w", err)
+			return nil, fmt.Errorf("creating CNAME record: %w", err)
 		}
 	case provider.RecordTypeTXT:
 		if err := p.client.AddTXTRecord(ctx, p.zone, record.Hostname, record.Target, ttl); err != nil {
-			return fmt.Errorf("creating TXT record: %w", err)
+			return nil, fmt.Errorf("creating TXT record: %w", err)
 		}
 	case provider.RecordTypeSRV:
 		if record.SRV == nil {
-			return fmt.Errorf("creating SRV record: SRV data is required")
+			return nil, fmt.Errorf("creating SRV record: SRV data is required")
 		}
 		if err := p.client.AddSRVRecord(ctx, p.zone, record.Hostname, int(record.SRV.Priority), int(record.SRV.Weight), int(record.SRV.Port), record.Target, ttl); err != nil {
-			return fmt.Errorf("creating SRV record: %w", err)
+			return nil, fmt.Errorf("creating SRV record: %w", err)
 		}
 	case provider.RecordTypeHTTPS:
 		if record.HTTPS == nil {
-			return fmt.Errorf("creating HTTPS record: HTTPS data is required")
+			return nil, fmt.Errorf("creating HTTPS record: HTTPS data is required")
 		}
 		svcParams := buildSvcParams(record.HTTPS.ALPN)
 		if err := p.client.AddHTTPSRecord(ctx, p.zone, record.Hostname, int(record.HTTPS.Priority), record.HTTPS.TargetName, svcParams, ttl); err != nil {
-			return fmt.Errorf("creating HTTPS record: %w", err)
+			return nil, fmt.Errorf("creating HTTPS record: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported record type: %s", record.Type)
+		return nil, fmt.Errorf("unsupported record type: %s", record.Type)
 	}
 
 	p.logger.Info("created record",
@@ -327,14 +334,17 @@ func (p *Provider) Create(ctx context.Context, record provider.Record) error {
 
 	// Auto-create companion HTTPS record for A/AAAA records when enabled.
 	// This prevents ECH fallback errors in split-horizon DNS environments.
-	if err := p.createCompanionHTTPS(ctx, record.Hostname, record.Type, ttl); err != nil {
+	companion, created, err := p.createCompanionHTTPSWithResult(ctx, record.Hostname, record.Type, ttl)
+	if err != nil {
 		p.logger.Warn("companion HTTPS record creation failed (non-fatal)",
 			slog.String("hostname", record.Hostname),
 			slog.String("error", err.Error()),
 		)
 	}
-
-	return nil
+	if created {
+		return []provider.Record{companion}, nil
+	}
+	return nil, nil
 }
 
 // Delete removes a DNS record.
@@ -397,6 +407,12 @@ func (p *Provider) Delete(ctx context.Context, record provider.Record) error {
 // Update modifies an existing DNS record in place.
 // This implements the provider.Updater interface for native update support.
 func (p *Provider) Update(ctx context.Context, existing, desired provider.Record) error {
+	_, err := p.UpdateWithRelatedRecords(ctx, existing, desired)
+	return err
+}
+
+// UpdateWithRelatedRecords reports a companion created while updating a member.
+func (p *Provider) UpdateWithRelatedRecords(ctx context.Context, existing, desired provider.Record) ([]provider.Record, error) {
 	ttl := desired.TTL
 	if ttl <= 0 {
 		ttl = p.ttl
@@ -407,61 +423,62 @@ func (p *Provider) Update(ctx context.Context, existing, desired provider.Record
 	case provider.RecordTypeA:
 		if existing.Target != desired.Target || existing.TTL != ttl {
 			if err := p.client.UpdateARecord(ctx, p.zone, existing.Hostname, existing.Target, desired.Target, ttl); err != nil {
-				return fmt.Errorf("updating A record: %w", err)
+				return nil, fmt.Errorf("updating A record: %w", err)
 			}
 		}
 	case provider.RecordTypeAAAA:
 		if existing.Target != desired.Target || existing.TTL != ttl {
 			if err := p.client.UpdateAAAARecord(ctx, p.zone, existing.Hostname, existing.Target, desired.Target, ttl); err != nil {
-				return fmt.Errorf("updating AAAA record: %w", err)
+				return nil, fmt.Errorf("updating AAAA record: %w", err)
 			}
 		}
 	case provider.RecordTypeCNAME:
 		if err := p.client.UpdateCNAMERecord(ctx, p.zone, existing.Hostname, existing.Target, desired.Target, ttl); err != nil {
-			return fmt.Errorf("updating CNAME record: %w", err)
+			return nil, fmt.Errorf("updating CNAME record: %w", err)
 		}
 	case provider.RecordTypeSRV:
 		// SRV records need special handling - for now, fall back to delete+create
 		// Technitium doesn't have a straightforward SRV update API
 		if existing.SRV == nil || desired.SRV == nil {
-			return fmt.Errorf("updating SRV record: SRV data is required")
+			return nil, fmt.Errorf("updating SRV record: SRV data is required")
 		}
 		// Delete old record
 		if err := p.client.DeleteSRVRecord(ctx, p.zone, existing.Hostname, int(existing.SRV.Priority), int(existing.SRV.Weight), int(existing.SRV.Port), existing.Target); err != nil {
-			return fmt.Errorf("deleting old SRV record for update: %w", err)
+			return nil, fmt.Errorf("deleting old SRV record for update: %w", err)
 		}
 		// Create new record
 		if err := p.client.AddSRVRecord(ctx, p.zone, desired.Hostname, int(desired.SRV.Priority), int(desired.SRV.Weight), int(desired.SRV.Port), desired.Target, ttl); err != nil {
-			return fmt.Errorf("creating new SRV record for update: %w", err)
+			return nil, fmt.Errorf("creating new SRV record for update: %w", err)
 		}
 	case provider.RecordTypeHTTPS:
 		// Explicit HTTPS records use the existing delete+create path.
 		if existing.HTTPS == nil || desired.HTTPS == nil {
-			return fmt.Errorf("updating HTTPS record: HTTPS data is required")
+			return nil, fmt.Errorf("updating HTTPS record: HTTPS data is required")
 		}
 		oldParams := buildSvcParams(existing.HTTPS.ALPN)
 		if err := p.client.DeleteHTTPSRecord(ctx, p.zone, existing.Hostname, int(existing.HTTPS.Priority), existing.HTTPS.TargetName, oldParams); err != nil {
-			return fmt.Errorf("deleting old HTTPS record for update: %w", err)
+			return nil, fmt.Errorf("deleting old HTTPS record for update: %w", err)
 		}
 		newParams := buildSvcParams(desired.HTTPS.ALPN)
 		if err := p.client.AddHTTPSRecord(ctx, p.zone, desired.Hostname, int(desired.HTTPS.Priority), desired.HTTPS.TargetName, newParams, ttl); err != nil {
-			return fmt.Errorf("creating new HTTPS record for update: %w", err)
+			return nil, fmt.Errorf("creating new HTTPS record for update: %w", err)
 		}
 	case provider.RecordTypeTXT:
 		// TXT records (ownership markers) don't typically need updates
 		// If value changes, delete and recreate
 		if err := p.client.DeleteTXTRecord(ctx, p.zone, existing.Hostname, existing.Target); err != nil {
-			return fmt.Errorf("deleting old TXT record for update: %w", err)
+			return nil, fmt.Errorf("deleting old TXT record for update: %w", err)
 		}
 		if err := p.client.AddTXTRecord(ctx, p.zone, desired.Hostname, desired.Target, ttl); err != nil {
-			return fmt.Errorf("creating new TXT record for update: %w", err)
+			return nil, fmt.Errorf("creating new TXT record for update: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported record type: %s", desired.Type)
+		return nil, fmt.Errorf("unsupported record type: %s", desired.Type)
 	}
 
-	if err := p.createCompanionHTTPS(ctx, desired.Hostname, desired.Type, ttl); err != nil {
-		return fmt.Errorf("reconciling companion HTTPS record: %w", err)
+	companion, created, err := p.createCompanionHTTPSWithResult(ctx, desired.Hostname, desired.Type, ttl)
+	if err != nil {
+		return nil, fmt.Errorf("reconciling companion HTTPS record: %w", err)
 	}
 
 	p.logger.Info("updated record",
@@ -473,7 +490,10 @@ func (p *Provider) Update(ctx context.Context, existing, desired provider.Record
 		slog.Int("ttl", ttl),
 	)
 
-	return nil
+	if created {
+		return []provider.Record{companion}, nil
+	}
+	return nil, nil
 }
 
 // extractALPN extracts the ALPN value from Technitium's svcParams format.

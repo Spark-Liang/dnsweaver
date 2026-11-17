@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/maxfield-allison/dnsweaver/pkg/provider"
 )
@@ -110,7 +111,8 @@ func (r *Reconciler) reconcileDesiredSetWithState(ctx context.Context, set *desi
 				actions = append(actions, action)
 				continue
 			}
-			if err := instance.CreateRecordWithValues(ctx, record.Hostname, record.Type, record.Target, record.TTL, record.SRV, record.MX, record.Metadata); err != nil {
+			related, err := instance.CreateRecordWithRelatedRecords(ctx, record)
+			if err != nil {
 				action.Status = StatusFailed
 				action.Error = err.Error()
 				legacyUpgradeComplete = false
@@ -118,8 +120,11 @@ func (r *Reconciler) reconcileDesiredSetWithState(ctx context.Context, set *desi
 			} else {
 				managed = rememberRecordMember(managed, record)
 				cache.addRecord(instance.Name(), record)
-				if err := r.ensureMemberOwnership(ctx, instance, record, cache); err != nil {
-					r.rememberMemberOwnershipRepair(instance, record, desiredMember.StatefulProxmox)
+				metadata := r.memberOwnershipMetadata(instance, record, cache, related, desiredMember.StatefulProxmox)
+				if err := r.ensureMemberOwnership(ctx, instance, record, metadata, cache); err != nil {
+					repairRecord := record
+					repairRecord.Metadata = metadata
+					r.rememberMemberOwnershipRepair(instance, repairRecord, desiredMember.StatefulProxmox)
 					action.Status = StatusFailed
 					action.Error = fmt.Sprintf("creating member ownership: %v", err)
 					r.logger.Warn("failed to create member ownership record",
@@ -175,25 +180,31 @@ func (r *Reconciler) reconcileDesiredSetWithState(ctx context.Context, set *desi
 
 			action := memberAction(ActionUpdate, StatusSuccess, instance, record, "")
 			if !r.isDryRun() {
-				if err := instance.UpdateRecord(ctx, existing, record); err != nil {
+				related, err := instance.UpdateRecordWithRelatedRecords(ctx, existing, record)
+				if err != nil {
 					action.Status = StatusFailed
 					action.Error = err.Error()
 					legacyUpgradeComplete = false
 					desiredWritesSucceeded = false
-				} else if err := r.ensureMemberOwnership(ctx, instance, record, cache); err != nil {
-					r.rememberMemberOwnershipRepair(instance, record, desiredMember.StatefulProxmox)
-					action.Status = StatusFailed
-					action.Error = fmt.Sprintf("creating member ownership: %v", err)
-					legacyUpgradeComplete = false
-					desiredWritesSucceeded = false
-					r.logger.Warn("failed to create member ownership record",
-						slog.String("provider", instance.Name()),
-						slog.String("hostname", record.Hostname),
-						slog.String("target", record.Target),
-						slog.String("error", err.Error()),
-					)
 				} else {
-					managed = rememberRecordMember(managed, record)
+					metadata := r.memberOwnershipMetadata(instance, record, cache, related, desiredMember.StatefulProxmox)
+					if err := r.ensureMemberOwnership(ctx, instance, record, metadata, cache); err != nil {
+						repairRecord := record
+						repairRecord.Metadata = metadata
+						r.rememberMemberOwnershipRepair(instance, repairRecord, desiredMember.StatefulProxmox)
+						action.Status = StatusFailed
+						action.Error = fmt.Sprintf("creating member ownership: %v", err)
+						legacyUpgradeComplete = false
+						desiredWritesSucceeded = false
+						r.logger.Warn("failed to create member ownership record",
+							slog.String("provider", instance.Name()),
+							slog.String("hostname", record.Hostname),
+							slog.String("target", record.Target),
+							slog.String("error", err.Error()),
+						)
+					} else {
+						managed = rememberRecordMember(managed, record)
+					}
 				}
 			}
 			actions = append(actions, action)
@@ -202,7 +213,11 @@ func (r *Reconciler) reconcileDesiredSetWithState(ctx context.Context, set *desi
 
 		action := memberAction(ActionSkip, StatusSkipped, instance, record, errRecordAlreadyExists)
 		if mayManage && !r.isDryRun() {
-			if err := r.ensureMemberOwnership(ctx, instance, record, cache); err != nil {
+			metadata := r.memberOwnershipMetadata(instance, record, cache, nil, desiredMember.StatefulProxmox)
+			if err := r.ensureMemberOwnership(ctx, instance, record, metadata, cache); err != nil {
+				repairRecord := record
+				repairRecord.Metadata = metadata
+				r.rememberMemberOwnershipRepair(instance, repairRecord, desiredMember.StatefulProxmox)
 				action.Status = StatusFailed
 				action.Error = fmt.Sprintf("creating member ownership: %v", err)
 				desiredWritesSucceeded = false
@@ -381,16 +396,54 @@ func (r *Reconciler) deleteSetMember(ctx context.Context, instance *provider.Pro
 	return action, true
 }
 
-func (r *Reconciler) ensureMemberOwnership(ctx context.Context, instance *provider.ProviderInstance, record provider.Record, cache *recordCache) error {
+func (r *Reconciler) memberOwnershipMetadata(
+	instance *provider.ProviderInstance,
+	record provider.Record,
+	cache *recordCache,
+	related []provider.Record,
+	statefulProxmox bool,
+) map[string]string {
+	metadata := cloneOwnershipMetadata(record.Metadata)
+	if owner, ok := instance.Provider.(provider.RelatedRecordOwnership); ok && cache != nil {
+		for _, owned := range cache.ownedMembers(instance.Name(), instance.InstanceID) {
+			if !strings.EqualFold(strings.TrimSuffix(owned.Member.Hostname, "."), strings.TrimSuffix(record.Hostname, ".")) ||
+				(owned.Member.Type != provider.RecordTypeA && owned.Member.Type != provider.RecordTypeAAAA) {
+				continue
+			}
+			metadata = owner.MergeRelatedOwnershipMetadata(metadata, owned.Metadata)
+		}
+		metadata = owner.AddRelatedOwnershipMetadata(metadata, related)
+	}
+	if statefulProxmox {
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
+		metadata[statefulProxmoxOwnershipMetadataKey] = "true"
+	}
+	return metadata
+}
+
+func cloneOwnershipMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func (r *Reconciler) ensureMemberOwnership(ctx context.Context, instance *provider.ProviderInstance, record provider.Record, metadata map[string]string, cache *recordCache) error {
 	if !r.config.OwnershipTracking || !instance.Provider.Capabilities().SupportsOwnershipTXT {
 		return nil
 	}
-	desired := provider.MemberOwnershipRecord(record.Hostname, instance.TTL, instance.InstanceID, record, record.Metadata)
+	desired := provider.MemberOwnershipRecord(record.Hostname, instance.TTL, instance.InstanceID, record, metadata)
 	existing, found := cache.memberOwnershipRecord(instance.Name(), record, instance.InstanceID)
 	if found && existing.Target == desired.Target {
 		return nil
 	}
-	if err := instance.CreateMemberOwnershipRecord(ctx, record, record.Metadata); err != nil {
+	if err := instance.CreateMemberOwnershipRecord(ctx, record, metadata); err != nil {
 		return err
 	}
 	cache.addRecord(instance.Name(), desired)
@@ -455,8 +508,9 @@ func (r *Reconciler) updateSingleValueMember(
 	markerCreated := false
 	if r.config.OwnershipTracking && instance.Provider.Capabilities().SupportsOwnershipTXT {
 		if _, exists := cache.memberOwnershipRecord(instance.Name(), desired, instance.InstanceID); !exists {
-			newMarker = provider.MemberOwnershipRecord(desired.Hostname, instance.TTL, instance.InstanceID, desired, desired.Metadata)
-			if err := instance.CreateMemberOwnershipRecord(ctx, desired, desired.Metadata); err != nil {
+			metadata := r.memberOwnershipMetadata(instance, desired, cache, nil, desiredMember.StatefulProxmox)
+			newMarker = provider.MemberOwnershipRecord(desired.Hostname, instance.TTL, instance.InstanceID, desired, metadata)
+			if err := instance.CreateMemberOwnershipRecord(ctx, desired, metadata); err != nil {
 				action.Status = StatusFailed
 				action.Error = fmt.Sprintf("creating replacement ownership marker: %v", err)
 				return append(actions, action), managed
@@ -511,9 +565,14 @@ func recordMemberPresent(records []provider.Record, record provider.Record) bool
 	return false
 }
 
-// legacyOwnershipCovers reports whether a hostname-level marker written before
-// member ownership can vouch for a record of this type. Those releases never
-// managed MX or NS, so their markers grant no authority over such records.
+// legacyOwnershipCovers reports whether a pre-member marker from historical
+// releases can vouch for a record type they managed.
 func legacyOwnershipCovers(recordType provider.RecordType) bool {
-	return recordType != provider.RecordTypeMX && recordType != provider.RecordTypeNS
+	switch recordType {
+	case provider.RecordTypeA, provider.RecordTypeAAAA, provider.RecordTypeCNAME,
+		provider.RecordTypeTXT, provider.RecordTypeSRV, provider.RecordTypeHTTPS:
+		return true
+	default:
+		return false
+	}
 }

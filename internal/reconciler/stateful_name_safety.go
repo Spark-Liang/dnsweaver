@@ -7,6 +7,8 @@ import (
 	"github.com/maxfield-allison/dnsweaver/pkg/source"
 )
 
+const statefulProxmoxOwnershipMetadataKey = "dnsweaver.stateful-proxmox"
+
 func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 	statefulClaims map[string][]*source.Hostname,
 	cache *recordCache,
@@ -19,6 +21,32 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 	claimsByName := make(map[string][]*source.Hostname, len(statefulClaims))
 	for hostname, claims := range statefulClaims {
 		claimsByName[source.NormalizeHostname(hostname)] = append(claimsByName[source.NormalizeHostname(hostname)], claims...)
+	}
+	evidenceByName := make(map[string]map[string]*provider.ProviderInstance)
+	addStatefulEvidence := func(hostname string, instance *provider.ProviderInstance) {
+		normalized := source.NormalizeHostname(hostname)
+		if evidenceByName[normalized] == nil {
+			evidenceByName[normalized] = make(map[string]*provider.ProviderInstance)
+		}
+		evidenceByName[normalized][instance.Name()] = instance
+		if _, exists := claimsByName[normalized]; !exists {
+			claimsByName[normalized] = nil
+		}
+	}
+	for key, previousSet := range r.previousDesiredSnapshot() {
+		if !previousSet.StatefulProxmox {
+			continue
+		}
+		if instance, exists := r.providers.Get(previousSet.ProviderName); exists {
+			addStatefulEvidence(key.Hostname, instance)
+		}
+	}
+	for _, instance := range r.providers.All() {
+		for _, owned := range cache.ownedMembers(instance.Name(), instance.InstanceID) {
+			if owned.Metadata[statefulProxmoxOwnershipMetadataKey] == "true" {
+				addStatefulEvidence(owned.Member.Hostname, instance)
+			}
+		}
 	}
 	pendingByName := make(map[string][]memberOwnershipRepair)
 	r.mu.RLock()
@@ -54,6 +82,9 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 		hasWriter := false
 
 		for _, claim := range claims {
+			if claim == nil {
+				continue
+			}
 			candidates, _ := r.providersForClaim(claim)
 			for _, instance := range candidates {
 				hasWriter = true
@@ -61,6 +92,13 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 				if !r.effectiveAdoptExisting(claim, instance) {
 					adoptionAllowed = false
 				}
+			}
+		}
+		for _, instance := range evidenceByName[normalized] {
+			hasWriter = true
+			instances[instance.Name()] = instance
+			if !effectiveProviderAdoption(r, instance) {
+				adoptionAllowed = false
 			}
 		}
 
@@ -105,16 +143,17 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 				if _, owned := cache.memberOwnershipRecord(instance.Name(), record, instance.InstanceID); owned {
 					continue
 				}
+				if ownsRelatedRecord(instance, records, record, cache) {
+					continue
+				}
 				if pendingOwnershipRepairMatches(instance, record, pendingMemberRecords[instance.Identity]) {
 					continue
 				}
 				if !instance.Provider.Capabilities().SupportsOwnershipTXT && previousDesiredMemberMatches(previous, instance, record) {
 					continue
 				}
-				// A legacy hostname marker can still prove a single old-style
-				// member. It cannot prove that later siblings were not added by an
-				// operator, so mixed/multi-member names remain frozen. Legacy markers
-				// never authorized MX or NS records.
+				// A legacy hostname marker can still prove one historically managed
+				// member. It cannot authorize record types dnsweaver did not manage.
 				if hasLegacyOwner && len(records) == 1 && legacyOwnershipCovers(record.Type) {
 					continue
 				}
@@ -136,11 +175,46 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 	return blocked
 }
 
+func ownsRelatedRecord(
+	instance *provider.ProviderInstance,
+	records []provider.Record,
+	related provider.Record,
+	cache *recordCache,
+) bool {
+	owner, ok := instance.Provider.(provider.RelatedRecordOwnership)
+	if !ok {
+		return false
+	}
+	for _, parent := range records {
+		if parent.Type != provider.RecordTypeA && parent.Type != provider.RecordTypeAAAA {
+			continue
+		}
+		marker, owned := cache.memberOwnershipRecord(instance.Name(), parent, instance.InstanceID)
+		if !owned {
+			continue
+		}
+		_, _, _, metadata := provider.ParseMemberOwnershipValue(marker.Target)
+		if owner.OwnsRelatedRecord(parent, related, metadata) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Reconciler) hasStatefulPendingOwnershipRepairs() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, repair := range r.pendingMemberOwnership {
 		if repair.StatefulProxmox {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Reconciler) hasStatefulPreviousDesired() bool {
+	for _, previous := range r.previousDesiredSnapshot() {
+		if previous.StatefulProxmox {
 			return true
 		}
 	}

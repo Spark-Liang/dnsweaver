@@ -161,6 +161,9 @@ type Workload struct {
 type SnapshotStatus struct {
 	Complete           bool
 	AllowOrphanCleanup bool
+	// StatefulProxmox reports that the source inventory is supplied by the
+	// opt-in Proxmox lifecycle adapter, even when it currently has no workloads.
+	StatefulProxmox bool
 	// BlockedHostnames are normalized DNS names whose automatic writes and
 	// removals must be held for this cycle (for example, a Proxmox name
 	// collision). This is intentionally optional and platform-agnostic.

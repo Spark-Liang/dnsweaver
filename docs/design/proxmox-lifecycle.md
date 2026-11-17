@@ -126,20 +126,35 @@ confirmed deleted or is outside the configured management filters.
 ## Unowned provider records
 
 With ownership tracking enabled and effective adoption disabled, a stateful
-Proxmox claim also freezes its normalized DNS name when the provider snapshot
-contains any member without matching ownership evidence. For providers without
-ownership TXT support, an exact member from this process's previous desired set
-is also evidence of local ownership; that evidence is in-memory and is not
-restored after restart. The freeze covers all record types at that name,
-including A, AAAA, ordinary TXT, type replacement, TTL changes, ownership
-writes, and pending recovery or repair for any member that does not match
-ownership evidence. A stateful pending member-ownership repair keeps its old DNS
-name in preflight after the PVE name changes, and may retry only when its locally
-recorded member still matches the observed target, TTL, and provider options. A
-legacy hostname-level ownership marker can identify one old-style member, but
-does not prove that additional siblings were created by dnsweaver; it never
-authorized MX or NS records. Uncontested names continue to reconcile even when
-lifecycle orphan cleanup is not enabled by the PVE scope declaration.
+Proxmox name is frozen when the provider snapshot contains any member without
+matching ownership evidence. Preflight includes current claims, prior stateful
+desired sets, durable stateful member ownership markers, and pending recovery or
+repair names. The stateful source continues to trigger preflight for an empty
+inventory so a confirmed deletion cannot bypass the same-name RRset check. For
+providers without ownership TXT support, an exact member from this process's
+previous desired set is also evidence of local ownership; that evidence is
+in-memory and is not restored after restart.
+
+The freeze covers all record types at that name, including A, AAAA, HTTPS,
+ordinary TXT, CAA and other provider-visible types, type replacement, TTL
+changes, ownership writes, and pending recovery or repair for any member that
+does not match ownership evidence. A stateful pending member-ownership repair
+keeps its old DNS name in preflight after the PVE name changes, and may retry
+only when its locally recorded member still matches the observed target, TTL,
+and provider options. A legacy hostname-level marker can authorize only record
+types managed by the historical reconciler (A, AAAA, CNAME, TXT, SRV, and
+HTTPS), and only when it is the sole data member at the name; it cannot
+authorize CAA, MX, NS, or other types.
+
+Technitium's default automatic HTTPS companion is covered by related-record
+ownership metadata only when dnsweaver created the companion during the same
+provider operation. That provenance is stored on the parent address member's
+durable ownership marker and follows an address replacement at the name. A
+same-shaped manual HTTPS record without that evidence remains unowned and freezes
+the name. Automatic companions created before this metadata existed also remain
+unowned after restart and may require operator review; the implementation does
+not infer ownership from record shape. Uncontested names continue to reconcile
+even when lifecycle orphan cleanup is not enabled by the PVE scope declaration.
 
 Provider ownership migration is backend-scoped rather than name-scoped. While
 a stateful name is frozen, migration is held for that backend to prevent a
@@ -163,7 +178,8 @@ address instead of treating the workload as absent.
 1. `internal/proxmox.WorkloadListerAdapter` persists identity/state and emits
    a workload carrying the retained address.
 2. `pkg/workload.SnapshotStatusProvider` exposes completeness, removal safety,
-   and collision names without making the reconciler Proxmox-specific.
+   collision names, and whether an empty snapshot is from stateful Proxmox,
+   without making the reconciler otherwise Proxmox-specific.
 3. `internal/reconciler` folds those optional signals into its existing
    desired-set removal gate and freezes blocked normalized names.
 4. `sources/proxmox` and all provider implementations continue to receive the

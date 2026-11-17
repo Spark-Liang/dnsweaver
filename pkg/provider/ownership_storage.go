@@ -84,6 +84,68 @@ type CompactOwnershipProvider struct {
 	presentation bool
 }
 
+func (p *CompactOwnershipProvider) CreateWithRelatedRecords(ctx context.Context, record Record) ([]Record, error) {
+	if IsOwnershipStateRecord(record.Hostname) {
+		return nil, fmt.Errorf("reserved compact ownership name")
+	}
+	if record.Type == RecordTypeTXT && IsOwnershipRecord(record.Hostname) {
+		return nil, p.Create(ctx, record)
+	}
+	if err := p.checkForeignMutation(ctx, record, nil, false); err != nil {
+		return nil, err
+	}
+	if creator, ok := p.Provider.(RelatedRecordCreator); ok {
+		return creator.CreateWithRelatedRecords(ctx, record)
+	}
+	return nil, p.Provider.Create(ctx, record)
+}
+
+func (p *CompactOwnershipProvider) UpdateWithRelatedRecords(ctx context.Context, existing, desired Record) ([]Record, error) {
+	if IsOwnershipStateRecord(existing.Hostname) || IsOwnershipStateRecord(desired.Hostname) {
+		return nil, fmt.Errorf("reserved compact ownership name")
+	}
+	if desired.Type == RecordTypeTXT && IsOwnershipRecord(desired.Hostname) {
+		return nil, p.Update(ctx, existing, desired)
+	}
+	if err := p.checkForeignMutation(ctx, desired, &existing, false); err != nil {
+		return nil, err
+	}
+	if updater, ok := p.Provider.(RelatedRecordUpdater); ok {
+		return updater.UpdateWithRelatedRecords(ctx, existing, desired)
+	}
+	if updater, ok := p.Provider.(Updater); ok {
+		return nil, updater.Update(ctx, existing, desired)
+	}
+	if err := p.Provider.Delete(ctx, existing); err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	if creator, ok := p.Provider.(RelatedRecordCreator); ok {
+		return creator.CreateWithRelatedRecords(ctx, desired)
+	}
+	return nil, p.Provider.Create(ctx, desired)
+}
+
+func (p *CompactOwnershipProvider) AddRelatedOwnershipMetadata(metadata map[string]string, related []Record) map[string]string {
+	owner, ok := p.Provider.(RelatedRecordOwnership)
+	if !ok {
+		return metadata
+	}
+	return owner.AddRelatedOwnershipMetadata(metadata, related)
+}
+
+func (p *CompactOwnershipProvider) MergeRelatedOwnershipMetadata(metadata, previous map[string]string) map[string]string {
+	owner, ok := p.Provider.(RelatedRecordOwnership)
+	if !ok {
+		return metadata
+	}
+	return owner.MergeRelatedOwnershipMetadata(metadata, previous)
+}
+
+func (p *CompactOwnershipProvider) OwnsRelatedRecord(parent, related Record, metadata map[string]string) bool {
+	owner, ok := p.Provider.(RelatedRecordOwnership)
+	return ok && owner.OwnsRelatedRecord(parent, related, metadata)
+}
+
 // NewCompactOwnershipProvider decorates a TXT-capable, zone-enumerating provider.
 // Callers sharing a physical backend and owner must supply the same local mutex.
 // No state is persisted outside DNS. An empty owner retains single-instance semantics.

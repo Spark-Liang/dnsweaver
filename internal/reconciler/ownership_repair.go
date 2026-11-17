@@ -35,6 +35,12 @@ func (r *Reconciler) rememberMemberOwnershipRepair(instance *provider.ProviderIn
 		r.pendingMemberOwnership = make(map[memberOwnershipRepairKey]memberOwnershipRepair)
 	}
 	stateful := len(statefulProxmox) > 0 && statefulProxmox[0]
+	if stateful {
+		if record.Metadata == nil {
+			record.Metadata = make(map[string]string)
+		}
+		record.Metadata[statefulProxmoxOwnershipMetadataKey] = "true"
+	}
 	r.pendingMemberOwnership[key] = memberOwnershipRepair{
 		Instance:        instance,
 		Record:          record,
@@ -95,7 +101,8 @@ func (r *Reconciler) retryMemberOwnership(ctx context.Context, cache *recordCach
 			_, err = sharing.CanShareOwnership(ctx, records[index], record)
 		}
 		if err == nil {
-			err = r.ensureMemberOwnership(ctx, instance, record, cache)
+			metadata := r.memberOwnershipMetadata(instance, record, cache, nil, repair.StatefulProxmox)
+			err = r.ensureMemberOwnership(ctx, instance, record, metadata, cache)
 		}
 		if err != nil {
 			blocked[route] = true

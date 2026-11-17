@@ -475,6 +475,26 @@ type UnmanagedRecordLister interface {
 	ListUnmanagedRecords(ctx context.Context) ([]Record, error)
 }
 
+// RelatedRecordCreator reports provider-generated companion records created as
+// part of a member write. The reconciler can persist provenance on the parent
+// member's ownership marker without treating matching manual records as owned.
+type RelatedRecordCreator interface {
+	CreateWithRelatedRecords(context.Context, Record) ([]Record, error)
+}
+
+// RelatedRecordUpdater reports companions created while updating a member.
+type RelatedRecordUpdater interface {
+	UpdateWithRelatedRecords(context.Context, Record, Record) ([]Record, error)
+}
+
+// RelatedRecordOwnership lets a provider persist and verify ownership evidence
+// for records it creates as companions to a managed member.
+type RelatedRecordOwnership interface {
+	AddRelatedOwnershipMetadata(metadata map[string]string, related []Record) map[string]string
+	MergeRelatedOwnershipMetadata(metadata, previous map[string]string) map[string]string
+	OwnsRelatedRecord(parent, related Record, metadata map[string]string) bool
+}
+
 // Updater is an optional interface that providers can implement to support
 // native in-place record updates. This is more efficient than delete+create
 // and avoids brief DNS gaps when changing record values.

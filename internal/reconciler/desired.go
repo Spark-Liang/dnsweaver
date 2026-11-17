@@ -40,8 +40,9 @@ type desiredCompilation struct {
 }
 
 type previousDesiredSet struct {
-	ProviderName string
-	Records      []provider.Record
+	ProviderName    string
+	Records         []provider.Record
+	StatefulProxmox bool
 }
 
 // compileDesiredRecordSets routes source claims to physical provider backends,
@@ -276,8 +277,9 @@ func (r *Reconciler) previousDesiredSnapshot() map[desiredSetKey]previousDesired
 	snapshot := make(map[desiredSetKey]previousDesiredSet, len(r.previousDesired))
 	for key, set := range r.previousDesired {
 		snapshot[key] = previousDesiredSet{
-			ProviderName: set.ProviderName,
-			Records:      append([]provider.Record(nil), set.Records...),
+			ProviderName:    set.ProviderName,
+			Records:         append([]provider.Record(nil), set.Records...),
+			StatefulProxmox: set.StatefulProxmox,
 		}
 	}
 	return snapshot
@@ -306,6 +308,7 @@ func (r *Reconciler) rememberStatefulDesired(
 		}
 		if desired, exists := next[set.Key]; exists {
 			desired.Records = append([]provider.Record(nil), desired.Records...)
+			desired.StatefulProxmox = true
 			previous[set.Key] = desired
 			changed = true
 		}

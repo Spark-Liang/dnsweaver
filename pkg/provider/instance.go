@@ -232,6 +232,28 @@ func (pi *ProviderInstance) CreateRecordWithValues(ctx context.Context, hostname
 	return err
 }
 
+// CreateRecordWithRelatedRecords creates one member and returns any companion
+// records the provider created as part of that write.
+func (pi *ProviderInstance) CreateRecordWithRelatedRecords(ctx context.Context, record Record) ([]Record, error) {
+	start := time.Now()
+	var related []Record
+	var err error
+	if creator, ok := pi.Provider.(RelatedRecordCreator); ok {
+		related, err = creator.CreateWithRelatedRecords(ctx, record)
+	} else {
+		err = pi.Provider.Create(ctx, record)
+	}
+	duration := time.Since(start).Seconds()
+
+	status := statusSuccess
+	if err != nil {
+		status = statusError
+	}
+	metrics.ProviderAPIRequestsTotal.WithLabelValues(pi.Name(), "create", status).Inc()
+	metrics.ProviderAPIDuration.WithLabelValues(pi.Name(), "create").Observe(duration)
+	return related, err
+}
+
 // DeleteRecord removes the DNS record for the given hostname.
 func (pi *ProviderInstance) DeleteRecord(ctx context.Context, hostname string) error {
 	record := Record{
@@ -773,6 +795,27 @@ func (c *ProviderInstanceConfig) Validate() error {
 	}
 
 	return nil
+}
+
+// UpdateRecordWithRelatedRecords updates one member and returns any companion
+// records created by that operation.
+func (pi *ProviderInstance) UpdateRecordWithRelatedRecords(ctx context.Context, existing, desired Record) ([]Record, error) {
+	if updater, ok := pi.Provider.(RelatedRecordUpdater); ok {
+		start := time.Now()
+		related, err := updater.UpdateWithRelatedRecords(ctx, existing, desired)
+		duration := time.Since(start).Seconds()
+		status := statusSuccess
+		if err != nil {
+			status = statusError
+		}
+		metrics.ProviderAPIRequestsTotal.WithLabelValues(pi.Name(), "update", status).Inc()
+		metrics.ProviderAPIDuration.WithLabelValues(pi.Name(), "update").Observe(duration)
+		return related, err
+	}
+	if err := pi.UpdateRecord(ctx, existing, desired); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // UseRegex returns true if regex patterns should be used instead of glob.
