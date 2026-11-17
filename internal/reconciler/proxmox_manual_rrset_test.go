@@ -21,10 +21,13 @@ import (
 )
 
 type proxmoxManualRRsetRecord struct {
-	Name   string
-	Type   string
-	Target string
-	TTL    int
+	Name            string
+	Type            string
+	Target          string
+	TTL             int
+	HTTPSPriority   int
+	HTTPSTargetName string
+	HTTPSParams     string
 }
 
 type proxmoxManualRRsetWrite struct {
@@ -62,8 +65,11 @@ func (f *proxmoxManualRRsetAPI) handler(t *testing.T) http.Handler {
 		target := params.Get("ipAddress")
 		if recordType == "TXT" {
 			target = params.Get("text")
+		} else if recordType == "HTTPS" {
+			target = params.Get("svcTargetName")
 		}
 		ttl, _ := strconv.Atoi(params.Get("ttl"))
+		httpsPriority, _ := strconv.Atoi(params.Get("svcPriority"))
 
 		switch r.URL.Path {
 		case "/api/zones/records/get":
@@ -75,6 +81,10 @@ func (f *proxmoxManualRRsetAPI) handler(t *testing.T) http.Handler {
 					rdata["ipAddress"] = record.Target
 				case "TXT":
 					rdata["text"] = record.Target
+				case "HTTPS":
+					rdata["svcPriority"] = record.HTTPSPriority
+					rdata["svcTargetName"] = record.HTTPSTargetName
+					rdata["svcParams"] = record.HTTPSParams
 				}
 				apiRecords = append(apiRecords, map[string]any{
 					"name": record.Name, "type": record.Type, "ttl": record.TTL,
@@ -104,14 +114,26 @@ func (f *proxmoxManualRRsetAPI) handler(t *testing.T) http.Handler {
 					}
 				}
 			}
-			f.records = append(f.records, proxmoxManualRRsetRecord{Name: name, Type: recordType, Target: target, TTL: ttl})
+			record := proxmoxManualRRsetRecord{Name: name, Type: recordType, Target: target, TTL: ttl}
+			if recordType == "HTTPS" {
+				record.HTTPSPriority = httpsPriority
+				record.HTTPSTargetName = params.Get("svcTargetName")
+				record.HTTPSParams = params.Get("svcParams")
+			}
+			f.records = append(f.records, record)
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 		case "/api/zones/records/delete":
 			f.writes = append(f.writes, proxmoxManualRRsetWrite{
 				Path: r.URL.Path, Name: name, Type: recordType, Target: target,
 			})
 			f.records = slices.DeleteFunc(f.records, func(record proxmoxManualRRsetRecord) bool {
-				return record.Name == name && record.Type == recordType && record.Target == target
+				matches := record.Name == name && record.Type == recordType && record.Target == target
+				if recordType == "HTTPS" {
+					matches = matches && record.HTTPSPriority == httpsPriority &&
+						record.HTTPSTargetName == params.Get("svcTargetName") &&
+						record.HTTPSParams == params.Get("svcParams")
+				}
+				return matches
 			})
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 		case "/api/zones/records/update":
@@ -122,10 +144,22 @@ func (f *proxmoxManualRRsetAPI) handler(t *testing.T) http.Handler {
 			if newTarget == "" {
 				newTarget = params.Get("newText")
 			}
+			newHTTPSPriority, _ := strconv.Atoi(params.Get("newSvcPriority"))
 			for i := range f.records {
-				if f.records[i].Name == name && f.records[i].Type == recordType && f.records[i].Target == target {
+				matches := f.records[i].Name == name && f.records[i].Type == recordType && f.records[i].Target == target
+				if recordType == "HTTPS" {
+					matches = matches && f.records[i].HTTPSPriority == httpsPriority &&
+						f.records[i].HTTPSTargetName == params.Get("svcTargetName") &&
+						f.records[i].HTTPSParams == params.Get("svcParams")
+				}
+				if matches {
 					if newTarget != "" {
 						f.records[i].Target = newTarget
+					}
+					if recordType == "HTTPS" {
+						f.records[i].HTTPSPriority = newHTTPSPriority
+						f.records[i].HTTPSTargetName = params.Get("newSvcTargetName")
+						f.records[i].HTTPSParams = params.Get("newSvcParams")
 					}
 					if ttl > 0 {
 						f.records[i].TTL = ttl
@@ -146,6 +180,69 @@ func (f *proxmoxManualRRsetAPI) snapshot() ([]proxmoxManualRRsetRecord, []proxmo
 	return append([]proxmoxManualRRsetRecord(nil), f.records...), append([]proxmoxManualRRsetWrite(nil), f.writes...)
 }
 
+func (f *proxmoxManualRRsetAPI) addManualA(name, target string, ttl int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.records {
+		if f.records[i].Name == name && f.records[i].Type == "A" {
+			f.records[i].TTL = ttl
+		}
+	}
+	f.records = append(f.records, proxmoxManualRRsetRecord{Name: name, Type: "A", Target: target, TTL: ttl})
+}
+
+func (f *proxmoxManualRRsetAPI) clearWrites() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes = nil
+}
+
+func newProxmoxManualRRsetTechnitiumProvider(t *testing.T, baseURL string) provider.Provider {
+	t.Helper()
+	dnsProvider, err := technitium.New("dns", &technitium.Config{
+		URL: baseURL, Token: "fixture-token", Zone: "example.com", TTL: 300,
+	}, technitium.WithProviderLogger(quietLogger()))
+	if err != nil {
+		t.Fatalf("technitium.New: %v", err)
+	}
+	return dnsProvider
+}
+
+func newDefaultHTTPSProxmoxManualRRsetProviderFactory(t *testing.T, baseURL string) func() provider.Provider {
+	t.Helper()
+	for key, value := range map[string]string{
+		"DNSWEAVER_DNS_URL":                baseURL,
+		"DNSWEAVER_DNS_TOKEN":              "fixture-token",
+		"DNSWEAVER_DNS_ZONE":               "example.com",
+		"DNSWEAVER_DNS_AUTO_HTTPS_RECORDS": "",
+		"DNSWEAVER_DNS_AUTO_HTTPS_ALPN":    "",
+	} {
+		t.Setenv(key, value)
+	}
+	envConfig, err := technitium.LoadConfig("dns")
+	if err != nil {
+		t.Fatalf("LoadConfig with default HTTPS setting: %v", err)
+	}
+	if !envConfig.AutoHTTPSRecords {
+		t.Fatal("LoadConfig did not default AUTO_HTTPS_RECORDS to true")
+	}
+
+	factory := technitium.Factory()
+	return func() provider.Provider {
+		instance, err := factory(provider.FactoryConfig{
+			Name: "dns",
+			ProviderConfig: map[string]string{
+				"URL": envConfig.URL, "TOKEN": envConfig.Token, "ZONE": envConfig.Zone,
+			},
+			HTTP: provider.HTTPConfig{Logger: quietLogger()},
+		})
+		if err != nil {
+			t.Fatalf("Technitium factory with default HTTPS setting: %v", err)
+		}
+		return instance
+	}
+}
+
 func newStatefulProxmoxTechnitiumReconciler(
 	t *testing.T,
 	client *proxmoxclient.Client,
@@ -156,13 +253,19 @@ func newStatefulProxmoxTechnitiumReconciler(
 
 	dnsServer := httptest.NewServer(api.handler(t))
 	t.Cleanup(dnsServer.Close)
+	dnsProvider := newProxmoxManualRRsetTechnitiumProvider(t, dnsServer.URL)
+	return newStatefulProxmoxTechnitiumReconcilerWithProvider(t, client, stateFile, dnsProvider, false)
+}
+
+func newStatefulProxmoxTechnitiumReconcilerWithProvider(
+	t *testing.T,
+	client *proxmoxclient.Client,
+	stateFile string,
+	dnsProvider provider.Provider,
+	lifecycleScopeConfirmed bool,
+) (*Reconciler, *proxmoxclient.WorkloadListerAdapter) {
+	t.Helper()
 	logger := quietLogger()
-	dnsProvider, err := technitium.New("dns", &technitium.Config{
-		URL: dnsServer.URL, Token: "fixture-token", Zone: "example.com", TTL: 300,
-	}, technitium.WithProviderLogger(logger))
-	if err != nil {
-		t.Fatalf("technitium.New: %v", err)
-	}
 
 	providers := provider.NewRegistry(logger)
 	providers.SetInstanceID("test-instance")
@@ -190,7 +293,7 @@ func newStatefulProxmoxTechnitiumReconciler(
 	adapter := proxmoxclient.NewWorkloadListerAdapter(client, proxmoxclient.AdapterConfig{
 		LifecycleMode:               proxmoxclient.LifecycleModeStateful,
 		LifecycleStateFile:          stateFile,
-		LifecycleScopeConfirmed:     false,
+		LifecycleScopeConfirmed:     lifecycleScopeConfirmed,
 		LifecycleDeleteObservations: 2,
 		VMZone:                      "example.com",
 	}, logger)
