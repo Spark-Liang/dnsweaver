@@ -324,12 +324,12 @@ func run() error {
 			return fmt.Errorf("creating proxmox client: %w", err)
 		}
 		proxmoxLister := proxmoxclient.NewWorkloadListerAdapter(pveClient, proxmoxclient.AdapterConfig{
-			NodeFilter:          cfg.ProxmoxNodeFilter(),
-			TagFilter:           cfg.ProxmoxTagFilter(),
-			StateFilter:         cfg.ProxmoxStateFilter(),
-			InterfacePreference: cfg.ProxmoxInterfaceTagPrefix(),
-			AllowedInterfaces:   cfg.ProxmoxAllowedInterfaces(),
-			IPVersion:           proxmoxIPVersion(cfg),
+			NodeFilter:                  cfg.ProxmoxNodeFilter(),
+			TagFilter:                   cfg.ProxmoxTagFilter(),
+			StateFilter:                 cfg.ProxmoxStateFilter(),
+			InterfacePreference:         cfg.ProxmoxInterfaceTagPrefix(),
+			AllowedInterfaces:           cfg.ProxmoxAllowedInterfaces(),
+			IPVersion:                   proxmoxIPVersion(cfg),
 			LifecycleMode:               cfg.ProxmoxLifecycleMode(),
 			LifecycleStateFile:          cfg.ProxmoxLifecycleStateFile(),
 			LifecycleScopeConfirmed:     cfg.ProxmoxLifecycleScopeConfirmed(),

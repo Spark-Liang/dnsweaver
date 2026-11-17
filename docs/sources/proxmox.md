@@ -6,7 +6,7 @@ icon: material/server
 
 # Proxmox VE Source
 
-The Proxmox VE source creates DNS A records for running VMs and LXC containers on your Proxmox cluster. It polls the PVE API to discover workloads and resolves each resource's IP address — via the QEMU guest agent (VMs) or the LXC network configuration — then registers an A record mapping `<vm-name>.<domain>` to that IP.
+The Proxmox VE source polls the PVE API to discover VMs and LXC containers and resolves addresses through the QEMU guest agent or LXC network configuration. In the default legacy mode it creates records for running resources using `<vm-name>.<domain>`. The opt-in stateful lifecycle mode retains DNS state through stopped guests and transient address failures, and uses `<PVE name>.<cluster name>.<VM_ZONE>`.
 
 ## How It Works
 
@@ -44,9 +44,18 @@ flowchart LR
 | `DNSWEAVER_PROXMOX_NODE_FILTER` | No | _(all nodes)_ | Restrict discovery to a single PVE node name |
 | `DNSWEAVER_PROXMOX_TAG_FILTER` | No | _(all tags)_ | Only include resources with this tag (prefix match) |
 | `DNSWEAVER_PROXMOX_HOSTNAME_TAG_PREFIX` | No | — | Optional tag prefix in the form `<prefix>+<hostname>` used to override the discovered hostname. The first matching tag wins if multiple tags share the prefix. |
-| `DNSWEAVER_PROXMOX_INTERFACE_TAG_PREFIX` | No | — | Optional tag prefix in the form `<prefix>+<interface>` that selects a specific guest interface for IP resolution. A matching tag overrides the allow-list and can target an interface even if it is not otherwise allowed. |
-| `DNSWEAVER_PROXMOX_ALLOWED_INTERFACES` | No | — | Comma-separated allow-list of guest interface prefixes to consider when resolving IPs (for example `eth,ens`). Prefix matching is used, so `eth` matches `eth0` and `eth1`. If no allow-listed or tagged interface yields a usable IPv4 address, dnsweaver falls back to the first non-loopback IPv4 address instead of skipping the VM. |
-| `DNSWEAVER_PROXMOX_STATE_FILTER` | No | `running` | PVE resource status filter (`running`, `stopped`, etc.) |
+| `DNSWEAVER_PROXMOX_INTERFACE_TAG_PREFIX` | No | — | Optional tag prefix in the form `<prefix>+<interface>` that selects a specific guest interface for IP resolution. In stateful mode, a matching tag is exclusive, overrides the allow-list, and can target an interface even if it is not otherwise allowed. |
+| `DNSWEAVER_PROXMOX_ALLOWED_INTERFACES` | No | — | Comma-separated allow-list of guest interface prefixes to consider (for example `eth,ens`). Prefix matching is used, so `eth` matches `eth0` and `eth1`. Legacy mode may fall back to another non-loopback address; stateful mode does not silently substitute an unqualified interface. |
+| `DNSWEAVER_PROXMOX_STATE_FILTER` | No | `running` | PVE resource status filter (`running`, `stopped`, etc.). Stateful lifecycle mode includes stopped resources regardless of this filter. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_MODE` | No | `legacy` | Set to `stateful` to enable persistent lifecycle state and strict cluster-qualified names. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_STATE_FILE` | No | `proxmox-lifecycle.json` | Durable JSON state file used by stateful mode. Use one file per PVE cluster and one owning process. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_SCOPE_CONFIRMED` | No | `false` | Operator declaration that the PVE token can see the complete inventory. It does not verify permissions or pagination. |
+| `DNSWEAVER_PROXMOX_LIFECYCLE_DELETE_OBSERVATIONS` | No | `2` | Consecutive complete inventory observations required before deleting a confirmed-absent instance. |
+| `DNSWEAVER_PROXMOX_VM_ZONE` | Stateful only | — | DNS zone appended after the original PVE name and actual cluster name; required and validated as a DNS suffix. YAML config supports `${VAR}` and `${VAR:-default}` interpolation. |
+
+The YAML `proxmox.vm_zone` value supports the standard `${VAR}` and
+`${VAR:-default}` environment interpolation forms. Stateful mode also validates
+that the resolved value is a valid DNS suffix.
 | `DNSWEAVER_PROXMOX_IP_VERSION` | No | `ipv4` | Address families to resolve. `ipv4` emits A records, `ipv6` emits AAAA records, `dual` emits both for guests that have both. |
 | `DNSWEAVER_PROXMOX_DOMAIN_SUFFIX` | No | — | Domain suffix appended to VM names, e.g. `home.example.com` |
 | `DNSWEAVER_PROXMOX_TARGET_MODE` | No | `guest-ip` | Target resolution mode. `guest-ip` (default) emits an A record per VM IP. `instance` defers record type and target to the matching provider instance — useful for pointing all VMs at a reverse proxy via CNAME. |
@@ -66,7 +75,7 @@ DNSWEAVER_SOURCES=proxmox
 
 ## Hostname Resolution
 
-The source determines the DNS hostname for each workload using this logic:
+Legacy mode determines the DNS hostname for each workload using this logic:
 
 1. **VM name contains a dot** — used directly as an FQDN (e.g., `webserver.home.example.com`)
 2. **Domain suffix configured** — appended to the VM name (e.g., `webserver` + `home.example.com` → `webserver.home.example.com`)
@@ -74,6 +83,11 @@ The source determines the DNS hostname for each workload using this logic:
 
 When `DNSWEAVER_PROXMOX_HOSTNAME_TAG_PREFIX` is configured, the source uses the first
 matching `<prefix>+<hostname>` tag it finds and ignores any later matches.
+
+Stateful lifecycle mode ignores hostname override tags and always uses the original
+PVE name, the cluster name returned by `/cluster/status`, and the configured
+`DNSWEAVER_PROXMOX_VM_ZONE`. It fails closed if the cluster name or VM zone is
+unavailable; it does not substitute the API endpoint host.
 
 !!! note "Proxmox tag restrictions"
     Proxmox normalizes tag values, and stricter datacenter `tag-style` /
@@ -95,7 +109,10 @@ IP resolution differs by resource type:
 | **VM (QEMU)** | QEMU guest agent (`/agent/network-get-interfaces`) | Requires `qemu-guest-agent` installed and running in the VM |
 | **LXC container** | `netN` config fields, then the live interfaces API | Reads directly from the PVE API; no agent required |
 
-VMs without a running guest agent are skipped (a debug log entry is emitted). To include VMs, install and enable `qemu-guest-agent` inside the guest.
+In legacy mode, VMs without a running guest agent are skipped (a debug log entry
+is emitted). Stateful lifecycle mode retains the last confirmed address while
+QGA is unavailable or times out; install and enable `qemu-guest-agent` to refresh
+the guest's address.
 
 ### LXC containers
 
@@ -141,6 +158,9 @@ DNSWEAVER_PROXMOX_IP_VERSION=dual
 In `dual` mode a guest with both families produces two records for the same
 hostname, which is a legal pair that the reconciler allows to coexist. A guest
 with only one family produces only that record.
+In stateful mode, only address families selected by this setting qualify to
+refresh the persisted last-confirmed address; an IPv4-only observation does not
+clear a previously confirmed IPv6 address in `ipv6` mode.
 
 Address family is determined by parsing each address, not by trusting the API's
 family label — the QEMU guest agent reports `ipv4`/`ipv6` while the LXC
@@ -156,9 +176,13 @@ When interface selection is configured, dnsweaver resolves VM IPs in this order:
 
 1. A matching interface tag from `DNSWEAVER_PROXMOX_INTERFACE_TAG_PREFIX` (if present)
 2. The first interface whose name matches one of the prefixes in `DNSWEAVER_PROXMOX_ALLOWED_INTERFACES` (if configured)
-3. The first non-loopback IPv4 address found on any interface, as a fallback
+3. In legacy mode, the first non-loopback IPv4 address found on any interface, as a fallback
 
-This keeps the behavior predictable for multi-interface VMs while still avoiding host-only adapters by default when you configure an allow-list.
+In stateful mode, a matching interface tag is exclusive, even if an allow-list
+is also configured. If the tagged interface has no qualified address, the
+adapter keeps the last-confirmed address instead of falling back to another
+interface. An allow-list without a matching tag is also strict in stateful
+mode. Legacy mode retains its existing fallback behavior.
 
 ## Target Mode
 

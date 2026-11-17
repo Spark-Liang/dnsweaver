@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -176,14 +177,15 @@ func TestProxmoxLifecycleNodeMigrationUsesOneDesiredMember(t *testing.T) {
 }
 
 type proxmoxDNSFixture struct {
-	mu             sync.Mutex
-	resources      []proxmoxclient.ClusterResource
-	interfaces     []proxmoxclient.AgentNetworkInterface
-	agentError     bool
-	agentEmpty     bool
-	inventoryError bool
-	lxcConfig      map[string]string
-	lxcInterfaces []proxmoxclient.LXCInterface
+	mu              sync.Mutex
+	resources       []proxmoxclient.ClusterResource
+	interfaces      []proxmoxclient.AgentNetworkInterface
+	agentError      bool
+	agentEmpty      bool
+	agentEmptyVMIDs map[string]bool
+	inventoryError  bool
+	lxcConfig       map[string]string
+	lxcInterfaces   []proxmoxclient.LXCInterface
 }
 
 func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -209,7 +211,15 @@ func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, `{"errors":{"command":"QEMU guest agent is not running"}}`)
 			return
 		}
-		if f.agentEmpty {
+		segments := strings.Split(r.URL.Path, "/")
+		vmid := ""
+		for i, segment := range segments {
+			if segment == "qemu" && i+1 < len(segments) {
+				vmid = segments[i+1]
+				break
+			}
+		}
+		if f.agentEmpty || f.agentEmptyVMIDs[vmid] {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"result": []proxmoxclient.AgentNetworkInterface{}}})
 			return
 		}
@@ -475,6 +485,331 @@ func TestProxmoxStatefulLifecycleAbsentPendingCollisionRemainsFrozen(t *testing.
 	}
 	if answers := dnsAnswerRecords(ctx, t, backend); len(answers) != 1 || answers[0].Target != "10.20.0.10" {
 		t.Fatalf("unfrozen surviving instance has wrong DNS: %+v", answers)
+	}
+}
+
+func TestProxmoxStatefulNoAddressAbsentPendingCollisionStaysFrozenAfterRestart(t *testing.T) {
+	fixture := &proxmoxDNSFixture{
+		resources: []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+		interfaces: []proxmoxclient.AgentNetworkInterface{{
+			Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.10"}},
+		}},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	stateFile := filepath.Join(t.TempDir(), "proxmox-lifecycle.json")
+	r, backend, _ := newStatefulProxmoxDNSReconciler(t, client, stateFile, nil)
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	assertAnswers := func(want string) {
+		t.Helper()
+		answers := dnsAnswerRecords(ctx, t, backend)
+		if len(answers) != 1 || answers[0].Hostname != "web.test-cluster.example.com" || answers[0].Target != want {
+			t.Fatalf("DNS answers = %+v, want one member for %s", answers, want)
+		}
+	}
+	assertAnswers("10.20.0.10")
+
+	fixture.mu.Lock()
+	fixture.resources = append(fixture.resources, proxmoxclient.ClusterResource{
+		VMID: 101, Name: "WEB", Node: "pve-01", Type: "qemu", Status: "running",
+	})
+	fixture.agentEmptyVMIDs = map[string]bool{"101": true}
+	fixture.interfaces = []proxmoxclient.AgentNetworkInterface{{
+		Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.11"}},
+	}}
+	fixture.mu.Unlock()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("no-address collision reconcile: %v", err)
+	}
+	assertAnswers("10.20.0.10")
+
+	// The new adapter and reconciler must recover both the retained instance
+	// state and DNS ownership before the no-address collision member disappears.
+	r, backend, _ = newStatefulProxmoxDNSReconcilerWithBackend(t, client, stateFile, backend, nil)
+	if err := r.RecoverOwnership(ctx); err != nil {
+		t.Fatalf("recover ownership after restart: %v", err)
+	}
+	createdBefore := len(backend.GetCreated())
+	deletedBefore := len(backend.GetDeleted())
+	fixture.mu.Lock()
+	fixture.resources = []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}}
+	fixture.interfaces = []proxmoxclient.AgentNetworkInterface{{
+		Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.12"}},
+	}}
+	fixture.mu.Unlock()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("first absent-pending observation after restart: %v", err)
+	}
+	assertAnswers("10.20.0.10")
+	if len(backend.GetCreated()) != createdBefore || len(backend.GetDeleted()) != deletedBefore {
+		t.Fatalf("absent-pending name freeze wrote DNS: created=%+v deleted=%+v", backend.GetCreated(), backend.GetDeleted())
+	}
+
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("confirmed absent observation: %v", err)
+	}
+	assertAnswers("10.20.0.12")
+}
+
+func TestProxmoxStatefulNewIdentityWaitsForAddresslessAbsentPendingIdentity(t *testing.T) {
+	fixture := &proxmoxDNSFixture{
+		resources:       []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+		agentEmptyVMIDs: map[string]bool{"100": true},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	stateFile := filepath.Join(t.TempDir(), "proxmox-lifecycle.json")
+	extra := func(cfg *proxmoxclient.AdapterConfig) {
+		cfg.LifecycleDeleteObservations = 3
+	}
+	r, backend, _ := newStatefulProxmoxDNSReconciler(t, client, stateFile, extra)
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("initial addressless reconcile: %v", err)
+	}
+	if got := dnsAnswerRecords(ctx, t, backend); len(got) != 0 {
+		t.Fatalf("addressless initial identity created DNS: %+v", got)
+	}
+
+	fixture.mu.Lock()
+	fixture.resources = []proxmoxclient.ClusterResource{{VMID: 101, Name: "WEB", Node: "pve-01", Type: "qemu", Status: "running"}}
+	fixture.agentEmptyVMIDs = nil
+	fixture.interfaces = []proxmoxclient.AgentNetworkInterface{{
+		Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.12"}},
+	}}
+	fixture.mu.Unlock()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("new identity with first absent-pending observation: %v", err)
+	}
+	if got := dnsAnswerRecords(ctx, t, backend); len(got) != 0 {
+		t.Fatalf("new identity wrote DNS before the retained addressless identity was confirmed absent: %+v", got)
+	}
+
+	// The lifecycle file must carry the unseen name through a process restart,
+	// even though the old identity never had an address or ownership marker.
+	r, backend, _ = newStatefulProxmoxDNSReconcilerWithBackend(t, client, stateFile, backend, extra)
+	if err := r.RecoverOwnership(ctx); err != nil {
+		t.Fatalf("recover ownership after restart: %v", err)
+	}
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("second absent-pending observation after restart: %v", err)
+	}
+	if got := dnsAnswerRecords(ctx, t, backend); len(got) != 0 {
+		t.Fatalf("new identity wrote DNS before post-restart absence confirmation: %+v", got)
+	}
+
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("confirmed absent observation: %v", err)
+	}
+	answers := dnsAnswerRecords(ctx, t, backend)
+	if len(answers) != 1 || answers[0].Target != "10.20.0.12" || answers[0].Hostname != "web.test-cluster.example.com" {
+		t.Fatalf("new identity DNS after confirmed deletion = %+v, want WEB address only after confirmation", answers)
+	}
+}
+
+func TestProxmoxStatefulFilteredReappearanceResetsAbsenceCount(t *testing.T) {
+	fixture := &proxmoxDNSFixture{
+		resources: []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+		interfaces: []proxmoxclient.AgentNetworkInterface{{
+			Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.10"}},
+		}},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	stateFile := filepath.Join(t.TempDir(), "proxmox-lifecycle.json")
+	r, backend, _ := newStatefulProxmoxDNSReconciler(t, client, stateFile, func(cfg *proxmoxclient.AdapterConfig) {
+		cfg.NodeFilter = "pve-00"
+	})
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+
+	fixture.mu.Lock()
+	fixture.resources = nil
+	fixture.mu.Unlock()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("first absence: %v", err)
+	}
+
+	// The full inventory sees the same identity again, but the configured node
+	// filter keeps it outside desired state. This still breaks the absence run.
+	fixture.mu.Lock()
+	fixture.resources = []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-01", Type: "qemu", Status: "running"}}
+	fixture.mu.Unlock()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("filtered reappearance: %v", err)
+	}
+
+	fixture.mu.Lock()
+	fixture.resources = nil
+	fixture.mu.Unlock()
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("absence after filtered reappearance: %v", err)
+	}
+	answers := dnsAnswerRecords(ctx, t, backend)
+	if len(answers) != 1 || answers[0].Target != "10.20.0.10" {
+		t.Fatalf("non-consecutive absence observations removed DNS: %+v", answers)
+	}
+
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("second consecutive absence after reappearance: %v", err)
+	}
+	if answers = dnsAnswerRecords(ctx, t, backend); len(answers) != 0 {
+		t.Fatalf("confirmed consecutive absence left DNS: %+v", answers)
+	}
+}
+
+func TestProxmoxStatefulCollisionHoldsPendingReplacementAndOwnershipRepair(t *testing.T) {
+	const host = "web.test-cluster.example.com"
+	first := statefulProxmoxWorkload("cluster|qemu|100", "web", "pve-00", "100", "10.20.0.10")
+	second := statefulProxmoxWorkload("cluster|qemu|101", "WEB", "pve-01", "101", "10.20.0.11")
+	lister := &snapshotWorkloadLister{
+		workloads: []workload.Workload{first, second},
+		status:    workload.SnapshotStatus{Complete: true, AllowOrphanCleanup: true},
+	}
+	backend := newTestMockProvider("dns")
+	providers := testProviderRegistry(quietLogger(), backend)
+	providers.SetInstanceID("test-instance")
+	if err := providers.CreateInstance(provider.ProviderInstanceConfig{
+		Name: "dns", TypeName: "mock", RecordType: provider.RecordTypeA,
+		Target: "192.0.2.1", TTL: 300, Domains: []string{"*.example.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instance, ok := providers.Get("dns")
+	if !ok {
+		t.Fatal("DNS provider instance is missing")
+	}
+	adopt := true // isolate the lifecycle collision gate from unowned-record policy
+	instance.AdoptExisting = &adopt
+	compact, err := provider.NewCompactOwnershipProvider(backend, "test-instance", "example.com", quietLogger(), nil)
+	if err != nil {
+		t.Fatalf("NewCompactOwnershipProvider: %v", err)
+	}
+	instance.Provider = compact
+	sources := source.NewRegistry(quietLogger())
+	if err := sources.Register(proxmoxsource.New(
+		proxmoxsource.WithDomain("example.com"),
+		proxmoxsource.WithVMZone("example.com"),
+		proxmoxsource.WithLogger(quietLogger()),
+	)); err != nil {
+		t.Fatal(err)
+	}
+	r := New([]workload.Lister{lister}, sources, providers, WithConfig(DefaultConfig()), WithLogger(quietLogger()))
+	repair := provider.Record{Hostname: host, Type: provider.RecordTypeA, Target: "10.20.0.11", TTL: 300}
+	backend.AddRecord(repair)
+	r.rememberMemberOwnershipRepair(instance, repair)
+	if len(r.pendingMemberOwnership) != 1 {
+		t.Fatal("fixture did not create pending member ownership repair")
+	}
+	old := provider.Record{Hostname: host, Type: provider.RecordTypeA, Target: "10.20.0.10", TTL: 300}
+	key := replacementKey{Identity: instance.Identity, Hostname: source.NormalizeHostname(host)}
+	r.pendingReplacements = map[replacementKey]replacementRecovery{
+		key: {Instance: instance, Removed: []provider.Record{old}},
+	}
+
+	createdBefore := len(backend.GetCreated())
+	deletedBefore := len(backend.GetDeleted())
+	recordsBefore, err := backend.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := r.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("collision reconcile with pending recovery: %v", err)
+	}
+	recordsAfter, err := backend.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.GetCreated()) != createdBefore || len(backend.GetDeleted()) != deletedBefore || !reflect.DeepEqual(recordsAfter, recordsBefore) {
+		t.Fatalf("frozen name recovery wrote DNS or ownership data: actions=%+v before=%+v after=%+v created=%+v deleted=%+v",
+			result.Actions, recordsBefore, recordsAfter, backend.GetCreated(), backend.GetDeleted())
+	}
+	if len(r.pendingReplacements) != 1 || len(r.pendingMemberOwnership) != 1 {
+		t.Fatalf("collision discarded held recovery intent: replacements=%d ownership=%d", len(r.pendingReplacements), len(r.pendingMemberOwnership))
+	}
+}
+
+func TestProxmoxStatefulNoTXTProviderUsesPreviousDesiredEvidence(t *testing.T) {
+	fixture := &proxmoxDNSFixture{
+		resources: []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+		interfaces: []proxmoxclient.AgentNetworkInterface{{
+			Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.10"}},
+		}},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	backend := newTestMockProvider("dns")
+	backend.capabilities = &provider.Capabilities{
+		SupportsNativeUpdate: true,
+		SupportedRecordTypes: []provider.RecordType{provider.RecordTypeA},
+	}
+	r, backend, _ := newStatefulProxmoxDNSReconcilerWithBackend(
+		t, client, filepath.Join(t.TempDir(), "proxmox-lifecycle.json"), backend,
+		func(cfg *proxmoxclient.AdapterConfig) { cfg.LifecycleScopeConfirmed = false },
+	)
+
+	if _, err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial no-TXT reconcile: %v", err)
+	}
+	answers := dnsAnswerRecords(context.Background(), t, backend)
+	if len(answers) != 1 || answers[0].Target != "10.20.0.10" {
+		t.Fatalf("initial no-TXT answers = %+v, want 10.20.0.10", answers)
+	}
+
+	fixture.mu.Lock()
+	fixture.interfaces = []proxmoxclient.AgentNetworkInterface{{
+		Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.11"}},
+	}}
+	fixture.mu.Unlock()
+	result, err := r.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("updated no-TXT reconcile: %v", err)
+	}
+	if result.HasErrors() {
+		t.Fatalf("no-TXT provider was frozen after its own write: actions=%+v", result.Actions)
+	}
+	answers = dnsAnswerRecords(context.Background(), t, backend)
+	if len(answers) != 1 || answers[0].Target != "10.20.0.11" {
+		t.Fatalf("updated no-TXT answers = %+v, want 10.20.0.11", answers)
+	}
+}
+
+func TestProxmoxStatefulLegacyOwnershipDoesNotAuthorizeManualMXOrNSThroughReconcile(t *testing.T) {
+	for _, recordType := range []provider.RecordType{provider.RecordTypeMX, provider.RecordTypeNS} {
+		t.Run(string(recordType), func(t *testing.T) {
+			const host = "web.test-cluster.example.com"
+			backend := newTestMockProvider("dns")
+			backend.AddRecord(provider.Record{Hostname: host, Type: recordType, Target: "manual.example.net", TTL: 60})
+			backend.AddRecord(provider.OwnershipRecord(host, 300, "test-instance", nil))
+			recordsBefore, err := backend.List(context.Background())
+			if err != nil {
+				t.Fatalf("list seeded records: %v", err)
+			}
+
+			fixture := &proxmoxDNSFixture{
+				resources:  []proxmoxclient.ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"}},
+				interfaces: []proxmoxclient.AgentNetworkInterface{{Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.202"}}}},
+			}
+			_, client := newProxmoxFixtureClient(t, fixture)
+			r, backend, _ := newStatefulProxmoxDNSReconcilerWithBackend(
+				t, client, filepath.Join(t.TempDir(), "proxmox-lifecycle.json"), backend,
+				func(cfg *proxmoxclient.AdapterConfig) { cfg.LifecycleScopeConfirmed = false },
+			)
+			result, err := r.Reconcile(context.Background())
+			if err != nil {
+				t.Fatalf("reconcile name with legacy ownership: %v", err)
+			}
+			recordsAfter, err := backend.List(context.Background())
+			if err != nil {
+				t.Fatalf("list reconciled records: %v", err)
+			}
+			if !reflect.DeepEqual(recordsAfter, recordsBefore) || len(backend.GetCreated()) != 0 || len(backend.GetDeleted()) != 0 {
+				t.Fatalf("legacy marker authorized a write beside manual %s: actions=%+v before=%+v after=%+v created=%+v deleted=%+v",
+					recordType, result.Actions, recordsBefore, recordsAfter, backend.GetCreated(), backend.GetDeleted())
+			}
+		})
 	}
 }
 

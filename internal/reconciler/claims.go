@@ -11,17 +11,19 @@ import (
 )
 
 type extractedClaims struct {
-	Claims        []*source.Hostname
-	Unique        map[string]*source.Hostname
-	Complete      bool
-	BlockedNames  map[string]struct{}
+	Claims         []*source.Hostname
+	Unique         map[string]*source.Hostname
+	Complete       bool
+	BlockedNames   map[string]struct{}
+	StatefulClaims map[string][]*source.Hostname
 }
 
 func (r *Reconciler) extractClaims(ctx context.Context, workloads []workload.Workload, result *Result) extractedClaims {
 	extracted := extractedClaims{
-		Unique:       make(map[string]*source.Hostname),
-		Complete:     true,
-		BlockedNames: make(map[string]struct{}),
+		Unique:         make(map[string]*source.Hostname),
+		Complete:       true,
+		BlockedNames:   make(map[string]struct{}),
+		StatefulClaims: make(map[string][]*source.Hostname),
 	}
 	origins := make(map[string]string)
 	proxmoxOrigins := make(map[string]string)
@@ -34,9 +36,11 @@ func (r *Reconciler) extractClaims(ctx context.Context, workloads []workload.Wor
 		}
 		valid := r.validateClaims(hostnames, currentWorkload.Name, false, result)
 		selected := selectClaimsWithinWorkload(valid)
+		statefulProxmox := isStatefulProxmoxWorkload(currentWorkload)
 		for _, claim := range selected {
 			normalized := claim.NormalizedName()
-			if isStatefulProxmoxWorkload(currentWorkload) {
+			if statefulProxmox {
+				extracted.StatefulClaims[normalized] = append(extracted.StatefulClaims[normalized], claim)
 				if firstID, exists := proxmoxOrigins[normalized]; exists && firstID != currentWorkload.ID {
 					extracted.BlockedNames[normalized] = struct{}{}
 					r.logger.Error("freezing Proxmox DNS name after lifecycle identity collision",

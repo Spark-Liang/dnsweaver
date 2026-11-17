@@ -18,9 +18,10 @@ type replacementKey struct {
 // operator to inspect the backend. Old ownership markers stay in place until
 // the entire replacement has succeeded.
 type replacementRecovery struct {
-	Instance *provider.ProviderInstance
-	Removed  []provider.Record
-	Created  []provider.Record
+	Instance        *provider.ProviderInstance
+	Removed         []provider.Record
+	Created         []provider.Record
+	StatefulProxmox bool
 }
 
 func (r *Reconciler) reconcileCrossTypeSet(ctx context.Context, set *desiredRecordSet, cache *recordCache, previous, conflicts []provider.Record, allowRemovals bool) ([]Action, []provider.Record) {
@@ -41,7 +42,7 @@ func (r *Reconciler) reconcileCrossTypeSet(ctx context.Context, set *desiredReco
 		return actions, previous
 	}
 	before, _ := cache.getExistingRecords(inst.Name(), set.Key.Hostname, set.Key.RecordType)
-	recovery := replacementRecovery{Instance: inst}
+	recovery := replacementRecovery{Instance: inst, StatefulProxmox: hasStatefulProxmoxMember(set)}
 	var actions []Action
 	for _, old := range conflicts {
 		action := memberAction(ActionDelete, StatusSuccess, inst, old, "")

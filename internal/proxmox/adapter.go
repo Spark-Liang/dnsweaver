@@ -162,6 +162,8 @@ func NewWorkloadListerAdapter(c *Client, cfg AdapterConfig, logger *slog.Logger)
 		// A lifecycle inventory must retain stopped resources. The legacy
 		// running-only default is intentionally bypassed only in opt-in mode.
 		stateFilter = ""
+	} else if strings.TrimSpace(stateFilter) == "" {
+		stateFilter = stateRunning
 	}
 	snapshot := workload.SnapshotStatus{Complete: true, AllowOrphanCleanup: true}
 	var store *lifecycleStore
@@ -171,12 +173,12 @@ func NewWorkloadListerAdapter(c *Client, cfg AdapterConfig, logger *slog.Logger)
 	return &WorkloadListerAdapter{
 		client: c,
 		cfg: AdapterConfig{
-			NodeFilter:          cfg.NodeFilter,
-			TagFilter:           cfg.TagFilter,
-			StateFilter:         stateFilter,
-			InterfacePreference: cfg.InterfacePreference,
-			AllowedInterfaces:   cfg.AllowedInterfaces,
-			IPVersion:           ipVersion,
+			NodeFilter:                  cfg.NodeFilter,
+			TagFilter:                   cfg.TagFilter,
+			StateFilter:                 stateFilter,
+			InterfacePreference:         cfg.InterfacePreference,
+			AllowedInterfaces:           cfg.AllowedInterfaces,
+			IPVersion:                   ipVersion,
 			LifecycleMode:               lifecycleMode,
 			LifecycleStateFile:          stateFile,
 			LifecycleScopeConfirmed:     cfg.LifecycleScopeConfirmed,
@@ -370,6 +372,9 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 		if _, seen := inventoryObserved[key]; seen {
 			if _, filtered := filteredKeys[key]; filtered {
 				record.Status = LifecycleStateInventoryUnknown
+				record.LastSeenAt = now
+				record.MissingObservations = 0
+				record.Collision = false
 				next.Instances[key] = record
 				uncertain = true
 			}
@@ -408,7 +413,11 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 	// freeze a managed DNS name. Out-of-scope nodes/tags remain part of the
 	// complete inventory for deletion safety but cannot block this adapter's
 	// desired state.
-	collisionKeys, collisionNames := collisionIdentities(resources, a, clusterName)
+	for key, record := range next.Instances {
+		record.Collision = false
+		next.Instances[key] = record
+	}
+	collisionKeys, collisionNames := collisionIdentities(next.Instances, filteredKeys, a, clusterName)
 	for key := range collisionKeys {
 		if record, ok := next.Instances[key]; ok {
 			record.Collision = true
@@ -445,11 +454,11 @@ func (a *WorkloadListerAdapter) observeResource(ctx context.Context, resource Cl
 		return record.LastIPs, LifecycleStateStopped, nil
 	}
 	ips, err := ResolveIPs(ctx, a.client, resource, a.logger, ResolveOptions{
-		InterfacePreference:     parseInterfacePreferenceFromTags(resource.Tags, a.cfg.InterfacePreference),
-		AllowedInterfaces:       a.cfg.AllowedInterfaces,
-		WantV6:                  a.cfg.IPVersion.wantsV6(),
+		InterfacePreference:      parseInterfacePreferenceFromTags(resource.Tags, a.cfg.InterfacePreference),
+		AllowedInterfaces:        a.cfg.AllowedInterfaces,
+		WantV6:                   a.cfg.IPVersion.wantsV6(),
 		StrictInterfaceSelection: true,
-		PreserveTransientErrors: true,
+		PreserveTransientErrors:  true,
 	})
 	if err != nil {
 		var agentErr *ErrAgentNotRunning
@@ -460,6 +469,12 @@ func (a *WorkloadListerAdapter) observeResource(ctx context.Context, resource Cl
 			return record.LastIPs, LifecycleStateQGATimeout, nil
 		}
 		return ResolvedIPs{}, "", err
+	}
+	if !a.cfg.IPVersion.wantsV4() {
+		ips.V4 = ""
+	}
+	if !a.cfg.IPVersion.wantsV6() {
+		ips.V6 = ""
 	}
 	if ips.IsEmpty() {
 		return record.LastIPs, LifecycleStateSuccessfulEmpty, nil
@@ -500,15 +515,24 @@ func setLifecycleMetadata(w *workload.Workload, record lifecycleRecord, status s
 	}
 }
 
-func collisionIdentities(resources []ClusterResource, adapter *WorkloadListerAdapter, clusterName string) (map[string]struct{}, map[string]struct{}) {
-	byName := make(map[string][]string)
-	for _, resource := range resources {
-		name := adapter.lifecycleName(resource, clusterName)
+func collisionIdentities(records map[string]lifecycleRecord, filteredKeys map[string]struct{}, adapter *WorkloadListerAdapter, clusterName string) (map[string]struct{}, map[string]struct{}) {
+	byName := make(map[string]map[string]struct{})
+	for key, record := range records {
+		if _, filtered := filteredKeys[key]; filtered {
+			continue
+		}
+		cluster := record.ClusterName
+		if cluster == "" {
+			cluster = clusterName
+		}
+		name := adapter.lifecycleName(ClusterResource{Name: record.Name}, cluster)
 		if name == "" {
 			continue
 		}
-		key := lifecycleIdentity(clusterName, resource)
-		byName[name] = append(byName[name], key)
+		if byName[name] == nil {
+			byName[name] = make(map[string]struct{})
+		}
+		byName[name][key] = struct{}{}
 	}
 	collisions := make(map[string]struct{})
 	collisionNames := make(map[string]struct{})
@@ -517,7 +541,7 @@ func collisionIdentities(resources []ClusterResource, adapter *WorkloadListerAda
 			continue
 		}
 		collisionNames[name] = struct{}{}
-		for _, key := range keys {
+		for key := range keys {
 			collisions[key] = struct{}{}
 		}
 	}

@@ -119,7 +119,7 @@ func (r *Reconciler) reconcileDesiredSetWithState(ctx context.Context, set *desi
 				managed = rememberRecordMember(managed, record)
 				cache.addRecord(instance.Name(), record)
 				if err := r.ensureMemberOwnership(ctx, instance, record, cache); err != nil {
-					r.rememberMemberOwnershipRepair(instance, record)
+					r.rememberMemberOwnershipRepair(instance, record, desiredMember.StatefulProxmox)
 					action.Status = StatusFailed
 					action.Error = fmt.Sprintf("creating member ownership: %v", err)
 					r.logger.Warn("failed to create member ownership record",
@@ -181,7 +181,7 @@ func (r *Reconciler) reconcileDesiredSetWithState(ctx context.Context, set *desi
 					legacyUpgradeComplete = false
 					desiredWritesSucceeded = false
 				} else if err := r.ensureMemberOwnership(ctx, instance, record, cache); err != nil {
-					r.rememberMemberOwnershipRepair(instance, record)
+					r.rememberMemberOwnershipRepair(instance, record, desiredMember.StatefulProxmox)
 					action.Status = StatusFailed
 					action.Error = fmt.Sprintf("creating member ownership: %v", err)
 					legacyUpgradeComplete = false

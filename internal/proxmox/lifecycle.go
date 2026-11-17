@@ -34,39 +34,53 @@ const (
 const lifecycleSchemaVersion = 1
 
 type lifecycleRecord struct {
-	Key                 string       `json:"key"`
-	VMID                int          `json:"vmid"`
-	Type                string       `json:"type"`
-	Name                string       `json:"name"`
-	Node                string       `json:"node"`
-	ClusterName         string       `json:"cluster_name,omitempty"`
-	Generation          uint64       `json:"generation"`
-	Status              string       `json:"status"`
-	Collision           bool         `json:"collision,omitempty"`
-	LastIPs             ResolvedIPs  `json:"last_confirmed_ips"`
-	LastConfirmedAt     time.Time    `json:"last_confirmed_at,omitempty"`
-	LastSeenAt          time.Time    `json:"last_seen_at,omitempty"`
-	MissingObservations int          `json:"missing_observations,omitempty"`
+	Key                 string      `json:"key"`
+	VMID                int         `json:"vmid"`
+	Type                string      `json:"type"`
+	Name                string      `json:"name"`
+	Node                string      `json:"node"`
+	ClusterName         string      `json:"cluster_name,omitempty"`
+	Generation          uint64      `json:"generation"`
+	Status              string      `json:"status"`
+	Collision           bool        `json:"collision,omitempty"`
+	LastIPs             ResolvedIPs `json:"last_confirmed_ips"`
+	LastConfirmedAt     time.Time   `json:"last_confirmed_at,omitempty"`
+	LastSeenAt          time.Time   `json:"last_seen_at,omitempty"`
+	MissingObservations int         `json:"missing_observations,omitempty"`
 }
 
 type lifecycleFile struct {
-	Schema             int                        `json:"schema"`
-	Instances          map[string]lifecycleRecord `json:"instances"`
-	Tombstones         map[string]uint64          `json:"tombstones,omitempty"`
-	ObservedNonEmpty   bool                       `json:"observed_non_empty"`
+	Schema           int                        `json:"schema"`
+	Instances        map[string]lifecycleRecord `json:"instances"`
+	Tombstones       map[string]uint64          `json:"tombstones,omitempty"`
+	ObservedNonEmpty bool                       `json:"observed_non_empty"`
 }
 
 type lifecycleStore struct {
-	path string
-	mu   sync.Mutex
-	data lifecycleFile
+	path    string
+	mu      sync.Mutex
+	data    lifecycleFile
+	fileOps lifecycleFileOps
+}
+
+// lifecycleFileOps is scoped to one store so tests can fail the rename or
+// directory sync boundary without replacing process-wide os functions.
+type lifecycleFileOps struct {
+	rename        func(oldPath, newPath string) error
+	syncDirectory func(path string) error
 }
 
 func newLifecycleStore(path string) *lifecycleStore {
 	if strings.TrimSpace(path) == "" {
 		path = DefaultLifecycleStateFile
 	}
-	return &lifecycleStore{path: path}
+	return &lifecycleStore{
+		path: path,
+		fileOps: lifecycleFileOps{
+			rename:        os.Rename,
+			syncDirectory: syncLifecycleDirectory,
+		},
+	}
 }
 
 func (s *lifecycleStore) snapshot() (lifecycleFile, error) {
@@ -92,7 +106,14 @@ func (s *lifecycleStore) commit(next lifecycleFile) error {
 	if next.Tombstones == nil {
 		next.Tombstones = make(map[string]uint64)
 	}
-	if err := s.saveLocked(next); err != nil {
+	renamed, err := s.saveLocked(next)
+	if err != nil {
+		if renamed {
+			// The on-disk file now contains next even if directory sync failed.
+			// Drop the old in-memory snapshot so a later observation reloads the
+			// visible file instead of resurrecting deleted lifecycle state.
+			s.data = lifecycleFile{}
+		}
 		return err
 	}
 	s.data = cloneLifecycleFile(next)
@@ -129,40 +150,47 @@ func (s *lifecycleStore) loadLocked() error {
 	return nil
 }
 
-func (s *lifecycleStore) saveLocked(file lifecycleFile) error {
+func (s *lifecycleStore) saveLocked(file lifecycleFile) (bool, error) {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("creating proxmox lifecycle state directory: %w", err)
+		return false, fmt.Errorf("creating proxmox lifecycle state directory: %w", err)
 	}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encoding proxmox lifecycle state: %w", err)
+		return false, fmt.Errorf("encoding proxmox lifecycle state: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".proxmox-lifecycle-*.tmp")
 	if err != nil {
-		return fmt.Errorf("creating proxmox lifecycle state temporary file: %w", err)
+		return false, fmt.Errorf("creating proxmox lifecycle state temporary file: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("setting proxmox lifecycle state permissions: %w", err)
+		return false, fmt.Errorf("setting proxmox lifecycle state permissions: %w", err)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("writing proxmox lifecycle state: %w", err)
+		return false, fmt.Errorf("writing proxmox lifecycle state: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("syncing proxmox lifecycle state: %w", err)
+		return false, fmt.Errorf("syncing proxmox lifecycle state: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing proxmox lifecycle state: %w", err)
+		return false, fmt.Errorf("closing proxmox lifecycle state: %w", err)
 	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("replacing proxmox lifecycle state: %w", err)
+	if err := s.fileOps.rename(tmpName, s.path); err != nil {
+		return false, fmt.Errorf("replacing proxmox lifecycle state: %w", err)
 	}
-	directory, err := os.Open(dir)
+	if err := s.fileOps.syncDirectory(dir); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func syncLifecycleDirectory(path string) error {
+	directory, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening proxmox lifecycle state directory for sync: %w", err)
 	}

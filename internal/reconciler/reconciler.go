@@ -230,7 +230,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 	// Step 1: List all workloads from all platform listers
 	var allWorkloads []workload.Workload
 	blockedSnapshotNames := make(map[string]struct{})
-	snapshotSafe := true
+	snapshotComplete := true
+	snapshotScopeConfirmed := true
 	for _, lister := range r.listers {
 		workloads, err := lister.ListWorkloads(ctx)
 		if err != nil {
@@ -243,8 +244,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		allWorkloads = append(allWorkloads, workloads...)
 		if statusProvider, ok := lister.(workload.SnapshotStatusProvider); ok {
 			status := statusProvider.SnapshotStatus()
-			if !status.Complete || !status.AllowOrphanCleanup {
-				snapshotSafe = false
+			if !status.Complete {
+				snapshotComplete = false
+			}
+			if !status.AllowOrphanCleanup {
+				snapshotScopeConfirmed = false
 			}
 			for _, hostname := range status.BlockedHostnames {
 				blockedSnapshotNames[hostname] = struct{}{}
@@ -264,61 +268,103 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		slog.Bool("complete", extracted.Complete),
 	)
 
-	if !dryRun && r.config.OwnershipTracking {
-		for _, instance := range r.providers.All() {
-			if migrator, ok := instance.Provider.(provider.OwnershipMigrator); ok {
-				if err := migrator.MigrateOwnership(ctx); err != nil {
-					return nil, fmt.Errorf("preparing ownership for %s: %w", instance.Name(), err)
-				}
-			}
-		}
-	}
-
-	// Step 3: Build record cache for all providers (single List() call per provider).
-	// Built even in dry-run mode so orphan cleanup can report accurate record counts.
-	cache := newRecordCache(ctx, r.providers, r.logger)
-
-	// Step 4: Compile provider-routed desired sets, then reconcile every set
+	// Step 3: Compile provider-routed desired sets, then reconcile every set
 	// once. Previous in-memory sets and durable member markers contribute empty
 	// desired sets so removed routes and post-restart orphans are handled by the
 	// same exact-member diff.
 	compiled := r.compileDesiredRecordSets(extracted.Claims)
+	for _, set := range compiled.Sets {
+		if _, stateful := extracted.StatefulClaims[set.Key.Hostname]; stateful {
+			for i := range set.Members {
+				set.Members[i].StatefulProxmox = true
+			}
+		}
+	}
 	compiled.BlockedNames = make(map[string]struct{}, len(extracted.BlockedNames)+len(blockedSnapshotNames))
 	for hostname := range extracted.BlockedNames {
 		compiled.BlockedNames[hostname] = struct{}{}
 	}
 	for hostname := range blockedSnapshotNames {
-		compiled.BlockedNames[hostname] = struct{}{}
+		compiled.BlockedNames[source.NormalizeHostname(hostname)] = struct{}{}
 	}
+	preflightNames := len(compiled.BlockedNames) > 0 || len(extracted.StatefulClaims) > 0 ||
+		r.hasStatefulPendingOwnershipRepairs() || r.hasStatefulPendingReplacementRecoveries()
+	var cache *recordCache
+	if preflightNames {
+		cache = newRecordCacheWithUnmanaged(ctx, r.providers, r.logger, true)
+		for hostname := range r.blockStatefulNamesWithUnownedRecords(extracted.StatefulClaims, cache) {
+			compiled.BlockedNames[hostname] = struct{}{}
+		}
+	}
+
 	result.DesiredMembers = desiredMemberCount(compiled)
 	for _, action := range compiled.Skipped {
 		result.AddAction(action)
 	}
+	heldRoutes := r.heldReplacementRoutes(compiled.BlockedNames, compiled.RejectedNames)
+	blockedMigrationIdentities := r.blockedOwnershipIdentities(compiled.BlockedNames, heldRoutes)
+
+	// Ownership migration can write provider TXT state across a whole backend,
+	// so do not run it for a backend that contains a frozen stateful name.
+	// Provider migrations are not name-scoped; all unrelated desired names still
+	// reconcile normally.
+	migratedOwnership := false
+	if !dryRun && r.config.OwnershipTracking {
+		for _, instance := range r.providers.All() {
+			if _, blocked := blockedMigrationIdentities[instance.Identity]; blocked {
+				r.logger.Warn("skipping ownership migration for provider with frozen stateful name",
+					slog.String("provider", instance.Name()))
+				continue
+			}
+			if migrator, ok := instance.Provider.(provider.OwnershipMigrator); ok {
+				if err := migrator.MigrateOwnership(ctx); err != nil {
+					return nil, fmt.Errorf("preparing ownership for %s: %w", instance.Name(), err)
+				}
+				migratedOwnership = true
+			}
+		}
+	}
+
+	// Provider snapshots must follow any ownership migration writes. Without a
+	// preflight name, keep the legacy one-list path; stateful safety preflight
+	// necessarily reads once before deciding which migrations are safe.
+	if cache == nil || migratedOwnership {
+		cache = newRecordCacheWithUnmanaged(ctx, r.providers, r.logger, preflightNames)
+	}
+
 	// A contradictory name keeps every record it has until its sources agree,
 	// so pending recovery and repair writes at that name wait as well.
-	blockedReplacements := r.retryReplacements(ctx, cache, result, compiled.RejectedNames)
-	for key := range r.retryMemberOwnership(ctx, cache, result, compiled.RejectedNames) {
+	blockedReplacements := r.retryReplacements(ctx, cache, result, heldRoutes)
+	for key := range r.retryMemberOwnership(ctx, cache, result, heldRoutes) {
 		blockedReplacements[key] = true
 	}
-	for name := range compiled.RejectedNames {
-		blockedReplacements[name] = true
+	for key := range heldRoutes {
+		blockedReplacements[key] = true
 	}
 	sets, previous := r.reconciliationSets(compiled, cache)
 	nextPrevious := make(map[desiredSetKey]previousDesiredSet, len(previous)+len(compiled.Sets))
 	for key, prior := range previous {
 		nextPrevious[key] = prior
 	}
-	complete := extracted.Complete && compiled.RoutingComplete && snapshotSafe
+	complete := extracted.Complete && compiled.RoutingComplete && snapshotComplete
 	// A destination that could not be read cannot establish a safe route move.
 	// Preserve the old route until every provider snapshot is available.
 	for _, instance := range r.providers.All() {
 		complete = complete && cache.providerAvailable(instance.Name())
 	}
-	allowRemovals := r.config.CleanupOrphans && complete
-	if allowRemovals {
-		allowRemovals = r.memberRemovalsAllowed(compiled, cache, previous)
-	} else if r.config.CleanupOrphans && !complete {
+	memberRemovalsSafe := false
+	if r.config.CleanupOrphans && complete {
+		memberRemovalsSafe = r.memberRemovalsAllowed(compiled, cache, previous)
+	}
+	// An observed stateful set can replace its own stale members when the
+	// workload snapshot is complete. Orphan cleanup still requires the operator
+	// to confirm that the configured lifecycle scope is complete.
+	allowStatefulMemberRemovals := r.config.CleanupOrphans && memberRemovalsSafe
+	allowRemovals := allowStatefulMemberRemovals && snapshotScopeConfirmed
+	if r.config.CleanupOrphans && !complete {
 		r.logger.Warn("desired-state snapshot is partial; suppressing member removals")
+	} else if r.config.CleanupOrphans && !snapshotScopeConfirmed {
+		r.logger.Warn("lifecycle scope is unconfirmed; suppressing orphan cleanup")
 	}
 	failedDestinations := make(map[string]bool)
 	// A rejected destination publishes nothing, so its hostname's old route on
@@ -335,7 +381,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 				RecordType: string(set.Key.RecordType),
 				Target:     set.Instance.EffectiveTarget(),
 				Status:     StatusSkipped,
-				Error:      "Proxmox lifecycle name collision; DNS name frozen",
+				Error:      "stateful Proxmox DNS name frozen; provider writes are held",
 			})
 			failedDestinations[set.Key.Hostname] = true
 			continue
@@ -354,7 +400,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		// reconciliationSets places desired destinations before empty retired
 		// routes. Preserve the old route if a destination write was rejected,
 		// including policy skips and failed ownership-marker creation.
-		setRemovals := allowRemovals && (len(set.Members) != 0 || !failedDestinations[set.Key.Hostname])
+		setRemovals := (allowRemovals || (allowStatefulMemberRemovals && hasStatefulProxmoxMember(set))) &&
+			(len(set.Members) != 0 || !failedDestinations[set.Key.Hostname])
 		actions, managed := r.reconcileDesiredSetWithState(ctx, set, cache, priorRecords, setRemovals)
 		for _, action := range actions {
 			if action.Status == StatusFailed || (action.Status == StatusSkipped && action.Error != "" && action.Error != errRecordAlreadyExists) {
@@ -403,8 +450,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 	}
 	r.hostnameProviders = compiled.HostnameProviders
 	r.mu.Unlock()
-	if complete && !dryRun {
-		r.rememberDesired(nextPrevious)
+	if !dryRun {
+		if complete && snapshotScopeConfirmed {
+			r.rememberDesired(nextPrevious)
+		} else {
+			r.rememberStatefulDesired(compiled.Sets, nextPrevious)
+		}
 	}
 
 	result.Complete()

@@ -16,8 +16,10 @@ import (
 // All hostname keys are normalized to lowercase for case-insensitive lookups.
 type recordCache struct {
 	// records maps provider name -> normalized hostname -> list of records
-	records map[string]map[string][]provider.Record
-	logger  *slog.Logger
+	records            map[string]map[string][]provider.Record
+	unmanagedRecords   map[string]map[string][]provider.Record
+	unmanagedAvailable map[string]bool
+	logger             *slog.Logger
 }
 
 type cachedOwnedMember struct {
@@ -29,9 +31,18 @@ type cachedOwnedMember struct {
 // newRecordCache creates a new record cache by querying all providers.
 // Failed providers are logged but don't prevent caching other providers.
 func newRecordCache(ctx context.Context, providers *provider.Registry, logger *slog.Logger) *recordCache {
+	return newRecordCacheWithUnmanaged(ctx, providers, logger, false)
+}
+
+// newRecordCacheWithUnmanaged also queries optional complete-record providers
+// for types their normal List method omits. Those records are used only as
+// conflict evidence during stateful-name preflight.
+func newRecordCacheWithUnmanaged(ctx context.Context, providers *provider.Registry, logger *slog.Logger, includeUnmanaged bool) *recordCache {
 	cache := &recordCache{
-		records: make(map[string]map[string][]provider.Record),
-		logger:  logger,
+		records:            make(map[string]map[string][]provider.Record),
+		unmanagedRecords:   make(map[string]map[string][]provider.Record),
+		unmanagedAvailable: make(map[string]bool),
+		logger:             logger,
 	}
 
 	for _, inst := range providers.All() {
@@ -54,6 +65,26 @@ func newRecordCache(ctx context.Context, providers *provider.Registry, logger *s
 		}
 
 		cache.records[inst.Name()] = byHostname
+		if includeUnmanaged {
+			if lister, ok := unmanagedRecordLister(inst.Provider); ok {
+				unmanaged, err := lister.ListUnmanagedRecords(ctx)
+				if err != nil {
+					logger.Warn("failed to cache unmanaged records for provider",
+						slog.String("provider", inst.Name()),
+						slog.String("error", err.Error()),
+					)
+					cache.unmanagedAvailable[inst.Name()] = false
+					continue
+				}
+				unmanagedByHostname := make(map[string][]provider.Record)
+				for _, record := range unmanaged {
+					normalized := source.NormalizeHostname(record.Hostname)
+					unmanagedByHostname[normalized] = append(unmanagedByHostname[normalized], record)
+				}
+				cache.unmanagedRecords[inst.Name()] = unmanagedByHostname
+				cache.unmanagedAvailable[inst.Name()] = true
+			}
+		}
 		logger.Debug("cached records for provider",
 			slog.String("provider", inst.Name()),
 			slog.Int("total_records", len(providerRecords)),
@@ -62,6 +93,20 @@ func newRecordCache(ctx context.Context, providers *provider.Registry, logger *s
 	}
 
 	return cache
+}
+
+func unmanagedRecordLister(p provider.Provider) (provider.UnmanagedRecordLister, bool) {
+	for depth := 0; p != nil && depth < 8; depth++ {
+		if lister, ok := p.(provider.UnmanagedRecordLister); ok {
+			return lister, true
+		}
+		unwrapper, ok := p.(interface{ Unwrap() provider.Provider })
+		if !ok {
+			break
+		}
+		p = unwrapper.Unwrap()
+	}
+	return nil, false
 }
 
 // getExistingRecords returns cached DNS records for a hostname from a specific provider.
@@ -123,6 +168,33 @@ func (c *recordCache) getAllRecordsForHostname(providerName, hostname string) ([
 	}
 
 	return filtered, true
+}
+
+// getAllDataRecordsForHostname returns every data member at a name, including
+// ordinary TXT records. It excludes ownership markers so stateful name safety
+// can distinguish operator data from dnsweaver metadata.
+func (c *recordCache) getAllDataRecordsForHostname(providerName, hostname string) ([]provider.Record, bool) {
+	byHostname, exists := c.records[providerName]
+	if !exists || byHostname == nil {
+		return nil, false
+	}
+
+	if available, checked := c.unmanagedAvailable[providerName]; checked && !available {
+		return nil, false
+	}
+
+	normalized := source.NormalizeHostname(hostname)
+	var data []provider.Record
+	for _, record := range byHostname[normalized] {
+		if record.Type == provider.RecordTypeTXT && provider.IsOwnershipRecord(record.Hostname) {
+			continue
+		}
+		data = append(data, record)
+	}
+	for _, record := range c.unmanagedRecords[providerName][normalized] {
+		data = append(data, record)
+	}
+	return data, true
 }
 
 // hasOwnershipRecord checks if an ownership TXT record exists for the given hostname

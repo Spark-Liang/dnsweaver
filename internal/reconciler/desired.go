@@ -16,9 +16,10 @@ type desiredSetKey struct {
 }
 
 type desiredRecordMember struct {
-	Record     provider.Record
-	Claim      *source.Hostname
-	ClaimCount int
+	Record          provider.Record
+	Claim           *source.Hostname
+	ClaimCount      int
+	StatefulProxmox bool
 }
 
 type desiredRecordSet struct {
@@ -286,6 +287,41 @@ func (r *Reconciler) rememberDesired(next map[desiredSetKey]previousDesiredSet) 
 	r.mu.Lock()
 	r.previousDesired = next
 	r.mu.Unlock()
+}
+
+// rememberStatefulDesired records positive evidence from successful stateful
+// writes without treating an incomplete workload snapshot as authority to
+// forget earlier evidence. This lets non-TXT providers recognize their own
+// records when lifecycle scope is not confirmed, while removals still require
+// a complete snapshot.
+func (r *Reconciler) rememberStatefulDesired(
+	sets []*desiredRecordSet,
+	next map[desiredSetKey]previousDesiredSet,
+) {
+	previous := r.previousDesiredSnapshot()
+	changed := false
+	for _, set := range sets {
+		if !hasStatefulProxmoxMember(set) {
+			continue
+		}
+		if desired, exists := next[set.Key]; exists {
+			desired.Records = append([]provider.Record(nil), desired.Records...)
+			previous[set.Key] = desired
+			changed = true
+		}
+	}
+	if changed {
+		r.rememberDesired(previous)
+	}
+}
+
+func hasStatefulProxmoxMember(set *desiredRecordSet) bool {
+	for _, member := range set.Members {
+		if member.StatefulProxmox {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Reconciler) memberRemovalsAllowed(compiled desiredCompilation, cache *recordCache, previous map[desiredSetKey]previousDesiredSet) bool {

@@ -227,6 +227,24 @@ func TestInterfaceOrder(t *testing.T) {
 			opts: ResolveOptions{InterfacePreference: "eth1"},
 			want: []int{0, 1, 2},
 		},
+		{
+			name: "strict preference does not fall back to allow-list",
+			opts: ResolveOptions{
+				InterfacePreference:      "eth9",
+				AllowedInterfaces:        []string{"eth0"},
+				StrictInterfaceSelection: true,
+			},
+			want: []int{},
+		},
+		{
+			name: "strict preference selects only the tagged interface",
+			opts: ResolveOptions{
+				InterfacePreference:      "docker0",
+				AllowedInterfaces:        []string{"eth"},
+				StrictInterfaceSelection: true,
+			},
+			want: []int{2},
+		},
 	}
 
 	for _, tt := range tests {

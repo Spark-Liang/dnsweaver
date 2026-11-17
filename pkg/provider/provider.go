@@ -467,6 +467,14 @@ type Provider interface {
 	Delete(ctx context.Context, record Record) error
 }
 
+// UnmanagedRecordLister is an optional provider capability for complete
+// conflict checks. List returns records the provider can reconcile; this
+// interface also returns record types that List intentionally omits but whose
+// presence can make a same-name write unsafe.
+type UnmanagedRecordLister interface {
+	ListUnmanagedRecords(ctx context.Context) ([]Record, error)
+}
+
 // Updater is an optional interface that providers can implement to support
 // native in-place record updates. This is more efficient than delete+create
 // and avoids brief DNS gaps when changing record values.

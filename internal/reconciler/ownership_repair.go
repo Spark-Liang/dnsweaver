@@ -16,13 +16,14 @@ type memberOwnershipRepairKey struct {
 }
 
 type memberOwnershipRepair struct {
-	Instance *provider.ProviderInstance
-	Record   provider.Record
+	Instance        *provider.ProviderInstance
+	Record          provider.Record
+	StatefulProxmox bool
 }
 
 // Retain proof only after a confirmed local answer write, never after a create
 // conflict or from an unreferenced page. It grants no authority after restart.
-func (r *Reconciler) rememberMemberOwnershipRepair(instance *provider.ProviderInstance, record provider.Record) {
+func (r *Reconciler) rememberMemberOwnershipRepair(instance *provider.ProviderInstance, record provider.Record, statefulProxmox ...bool) {
 	if _, supported := instance.Provider.(provider.SharedOwnership); !supported || !r.config.OwnershipTracking || !instance.Provider.Capabilities().SupportsOwnershipTXT {
 		return
 	}
@@ -33,7 +34,12 @@ func (r *Reconciler) rememberMemberOwnershipRepair(instance *provider.ProviderIn
 	if r.pendingMemberOwnership == nil {
 		r.pendingMemberOwnership = make(map[memberOwnershipRepairKey]memberOwnershipRepair)
 	}
-	r.pendingMemberOwnership[key] = memberOwnershipRepair{instance, record}
+	stateful := len(statefulProxmox) > 0 && statefulProxmox[0]
+	r.pendingMemberOwnership[key] = memberOwnershipRepair{
+		Instance:        instance,
+		Record:          record,
+		StatefulProxmox: stateful,
+	}
 }
 
 // Repair at a held name stays pending without writing.

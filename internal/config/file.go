@@ -101,7 +101,7 @@ type FileProxmoxConfig struct {
 	LifecycleMode               string `yaml:"lifecycle_mode,omitempty"`
 	LifecycleStateFile          string `yaml:"lifecycle_state_file,omitempty"`
 	LifecycleScopeConfirmed     *bool  `yaml:"lifecycle_scope_confirmed,omitempty"`
-	LifecycleDeleteObservations *int  `yaml:"lifecycle_delete_observations,omitempty"`
+	LifecycleDeleteObservations *int   `yaml:"lifecycle_delete_observations,omitempty"`
 	VMZone                      string `yaml:"vm_zone,omitempty"`
 }
 
@@ -193,6 +193,7 @@ func (c *FileConfig) interpolateEnvVars() {
 	if c.Proxmox != nil {
 		c.Proxmox.LifecycleMode = InterpolateEnvVars(c.Proxmox.LifecycleMode)
 		c.Proxmox.LifecycleStateFile = InterpolateEnvVars(c.Proxmox.LifecycleStateFile)
+		c.Proxmox.VMZone = InterpolateEnvVars(c.Proxmox.VMZone)
 	}
 
 	if c.Kubernetes != nil {
@@ -268,36 +269,36 @@ func LoadFile(path string) (*FileConfig, error) {
 // Values from file take precedence over defaults; env vars override later.
 func (c *FileConfig) ToGlobalConfig() *GlobalConfig {
 	cfg := &GlobalConfig{
-		LogLevel:             DefaultLogLevel,
-		LogFormat:            DefaultLogFormat,
-		LogMaxSize:           DefaultLogMaxSize,
-		LogMaxBackups:        DefaultLogMaxBackups,
-		LogMaxAge:            DefaultLogMaxAge,
-		LogCompress:          DefaultLogCompress,
-		DryRun:               DefaultDryRun,
-		CleanupOrphans:       DefaultCleanupOrphans,
-		CleanupOnStop:        DefaultCleanupOnStop,
-		OwnershipTracking:    DefaultOwnershipTracking,
-		OwnershipStorage:     DefaultOwnershipStorage,
-		AdoptExisting:        DefaultAdoptExisting,
-		DefaultTTL:           DefaultTTL,
-		ReconcileInterval:    DefaultReconcileInterval,
-		ShutdownTimeout:      DefaultShutdownTimeout,
-		HealthPort:           DefaultHealthPort,
-		HealthAddress:        DefaultHealthAddress,
-		HealthAllowNetwork:   DefaultHealthAllowNetwork,
-		Platform:             DefaultPlatform,
-		DockerHost:           defaultDockerHost(),
-		DockerMode:           DefaultDockerMode,
-		DockerConnectTimeout: DefaultDockerConnectTimeout,
-		K8sWatchIngress:      true,
-		K8sWatchIngressRoute: true,
-		K8sWatchHTTPRoute:    true,
-		K8sWatchServices:     false,
-		Source:               DefaultSource,
-		ProxmoxLifecycleMode:              DefaultProxmoxLifecycleMode,
-		ProxmoxLifecycleStateFile:         DefaultProxmoxLifecycleStateFile,
-		ProxmoxLifecycleScopeConfirmed:    DefaultProxmoxLifecycleScopeConfirmed,
+		LogLevel:                           DefaultLogLevel,
+		LogFormat:                          DefaultLogFormat,
+		LogMaxSize:                         DefaultLogMaxSize,
+		LogMaxBackups:                      DefaultLogMaxBackups,
+		LogMaxAge:                          DefaultLogMaxAge,
+		LogCompress:                        DefaultLogCompress,
+		DryRun:                             DefaultDryRun,
+		CleanupOrphans:                     DefaultCleanupOrphans,
+		CleanupOnStop:                      DefaultCleanupOnStop,
+		OwnershipTracking:                  DefaultOwnershipTracking,
+		OwnershipStorage:                   DefaultOwnershipStorage,
+		AdoptExisting:                      DefaultAdoptExisting,
+		DefaultTTL:                         DefaultTTL,
+		ReconcileInterval:                  DefaultReconcileInterval,
+		ShutdownTimeout:                    DefaultShutdownTimeout,
+		HealthPort:                         DefaultHealthPort,
+		HealthAddress:                      DefaultHealthAddress,
+		HealthAllowNetwork:                 DefaultHealthAllowNetwork,
+		Platform:                           DefaultPlatform,
+		DockerHost:                         defaultDockerHost(),
+		DockerMode:                         DefaultDockerMode,
+		DockerConnectTimeout:               DefaultDockerConnectTimeout,
+		K8sWatchIngress:                    true,
+		K8sWatchIngressRoute:               true,
+		K8sWatchHTTPRoute:                  true,
+		K8sWatchServices:                   false,
+		Source:                             DefaultSource,
+		ProxmoxLifecycleMode:               DefaultProxmoxLifecycleMode,
+		ProxmoxLifecycleStateFile:          DefaultProxmoxLifecycleStateFile,
+		ProxmoxLifecycleScopeConfirmed:     DefaultProxmoxLifecycleScopeConfirmed,
 		ProxmoxLifecycleDeleteObservations: DefaultProxmoxLifecycleDeleteObservations,
 	}
 

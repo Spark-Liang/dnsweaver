@@ -247,6 +247,33 @@ func (p *Provider) List(ctx context.Context) ([]provider.Record, error) {
 	return records, nil
 }
 
+// ListUnmanagedRecords returns record types omitted by List. They are not
+// writable through this provider, but still participate in same-name safety
+// checks because a write to a sibling can replace or alter the whole RRset.
+func (p *Provider) ListUnmanagedRecords(ctx context.Context) ([]provider.Record, error) {
+	apiRecords, err := p.client.ListZoneRecords(ctx, p.zone)
+	if err != nil {
+		return nil, fmt.Errorf("listing unmanaged records: %w", err)
+	}
+
+	var records []provider.Record
+	for _, record := range apiRecords {
+		switch record.Type {
+		case "A", "AAAA", "CNAME", "TXT", "SRV", "HTTPS":
+			continue
+		default:
+			records = append(records, provider.Record{
+				Hostname:   record.Name,
+				Type:       provider.RecordType(record.Type),
+				TTL:        record.TTL,
+				ProviderID: fmt.Sprintf("%s:%s", record.Name, record.Type),
+			})
+		}
+	}
+
+	return records, nil
+}
+
 // Create adds a new DNS record.
 func (p *Provider) Create(ctx context.Context, record provider.Record) error {
 	ttl := record.TTL

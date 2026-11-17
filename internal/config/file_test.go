@@ -200,6 +200,51 @@ server:
 	}
 }
 
+func TestLoadFileInterpolatesProxmoxVMZone(t *testing.T) {
+	t.Setenv("DNSWEAVER_TEST_PROXMOX_VM_ZONE", "vm.example.com")
+	t.Setenv("DNSWEAVER_TEST_PROXMOX_VM_ZONE_DEFAULT", "")
+
+	tests := []struct {
+		name     string
+		value    string
+		expected string
+	}{
+		{
+			name:     "environment value",
+			value:    "${DNSWEAVER_TEST_PROXMOX_VM_ZONE}",
+			expected: "vm.example.com",
+		},
+		{
+			name:     "environment default",
+			value:    "${DNSWEAVER_TEST_PROXMOX_VM_ZONE_DEFAULT:-fallback.example.com}",
+			expected: "fallback.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yml")
+			content := "proxmox:\n  lifecycle_mode: stateful\n  vm_zone: \"" + tt.value + "\"\n"
+			if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			fileConfig, err := LoadFile(configPath)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			if fileConfig.Proxmox == nil {
+				t.Fatal("loaded Proxmox config is nil")
+			}
+			if fileConfig.Proxmox.VMZone != tt.expected {
+				t.Fatalf("interpolated file vm_zone = %q, want %q", fileConfig.Proxmox.VMZone, tt.expected)
+			}
+			if got := fileConfig.ToGlobalConfig().ProxmoxVMZone; got != tt.expected {
+				t.Fatalf("global vm_zone = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestToGlobalConfig(t *testing.T) {
 	dryRun := true
 	cleanup := false

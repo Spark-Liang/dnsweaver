@@ -157,11 +157,11 @@ func TestExtract_StatefulUsesStrictNameAndIgnoresHostnameTag(t *testing.T) {
 		Platform: workload.PlatformProxmox,
 		Name:     "Web",
 		Metadata: map[string]string{
-			"ip":                           "10.1.20.5",
-			"node":                         "pve-00",
-			"vmid":                         "100",
-			"tags":                         "dnsweaver+tag-override.vm.example.com",
-			"proxmox.lifecycle.mode":       "stateful",
+			"ip":                             "10.1.20.5",
+			"node":                           "pve-00",
+			"vmid":                           "100",
+			"tags":                           "dnsweaver+tag-override.vm.example.com",
+			"proxmox.lifecycle.mode":         "stateful",
 			"proxmox.lifecycle.cluster_name": "pve-cluster",
 		},
 	}

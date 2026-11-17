@@ -318,6 +318,9 @@ func interfaceOrder(names []string, opts ResolveOptions) []int {
 				add(i)
 			}
 		}
+		if opts.StrictInterfaceSelection {
+			return order
+		}
 	}
 
 	// Interface order wins over allow-list order, matching the documented

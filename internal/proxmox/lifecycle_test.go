@@ -3,6 +3,7 @@ package proxmox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -76,7 +77,7 @@ func (s *lifecycleTestServer) handler(w http.ResponseWriter, r *http.Request) {
 
 func statefulQEMUFixture() *lifecycleTestServer {
 	return &lifecycleTestServer{
-		resources: []ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning}},
+		resources:  []ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning}},
 		interfaces: []AgentNetworkInterface{{Name: "eth0", IPAddresses: []AgentIPAddress{{IPAddress: "10.20.0.10"}}}},
 	}
 }
@@ -297,7 +298,7 @@ func TestStatefulLifecycleNameCollisionBlocksHostname(t *testing.T) {
 	}
 }
 
-func TestStatefulLifecycleCollisionIgnoresFilteredResources(t *testing.T) {
+func TestStatefulLifecycleCollisionUnblocksWhenIdentityIsFiltered(t *testing.T) {
 	fixture := &lifecycleTestServer{
 		resources: []ClusterResource{
 			{VMID: 100, Name: "web", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning},
@@ -312,11 +313,19 @@ func TestStatefulLifecycleCollisionIgnoresFilteredResources(t *testing.T) {
 		LifecycleStateFile:          filepath.Join(t.TempDir(), "lifecycle.json"),
 		LifecycleScopeConfirmed:     true,
 		LifecycleDeleteObservations: 2,
-		NodeFilter:                  "pve-00",
 		VMZone:                      "example.com",
 	}, testLogger())
 
 	workloads, err := adapter.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("initial collision ListWorkloads: %v", err)
+	}
+	if len(workloads) != 2 || len(adapter.SnapshotStatus().BlockedHostnames) != 1 {
+		t.Fatalf("initial collision workloads/status = %+v / %+v, want both identities frozen", workloads, adapter.SnapshotStatus())
+	}
+
+	adapter.cfg.NodeFilter = "pve-00"
+	workloads, err = adapter.ListWorkloads(context.Background())
 	if err != nil {
 		t.Fatalf("filtered collision ListWorkloads: %v", err)
 	}
@@ -325,7 +334,7 @@ func TestStatefulLifecycleCollisionIgnoresFilteredResources(t *testing.T) {
 	}
 	status := adapter.SnapshotStatus()
 	if len(status.BlockedHostnames) != 0 {
-		t.Fatalf("filtered resource froze managed hostname: %+v", status.BlockedHostnames)
+		t.Fatalf("filtered retained collision froze managed hostname: %+v", status.BlockedHostnames)
 	}
 	if got := workloads[0].Metadata["proxmox.lifecycle.state"]; got == LifecycleStateNameCollision {
 		t.Fatalf("managed workload was marked as a collision: %q", got)
@@ -373,6 +382,74 @@ func TestStatefulLifecycleStrictInterfaceSelectionDoesNotFallback(t *testing.T) 
 	}
 	if _, ok := workloads[0].Metadata[metaKeyIP]; ok {
 		t.Fatalf("strict allow-list silently fell back to eth1: %+v", workloads[0].Metadata)
+	}
+}
+
+func TestStatefulLifecycleInterfaceTagDoesNotFallbackToAllowList(t *testing.T) {
+	fixture := &lifecycleTestServer{
+		resources: []ClusterResource{{
+			VMID: 200, Name: "multi", Node: "pve-00", Type: resourceTypeQEMU,
+			Status: stateRunning, Tags: "dnsweaver+eth9",
+		}},
+		interfaces: []AgentNetworkInterface{{Name: "eth0", IPAddresses: []AgentIPAddress{{IPAddress: "10.20.0.10"}}}},
+	}
+	adapter, closeServer := newStatefulTestAdapter(t, fixture, filepath.Join(t.TempDir(), "lifecycle.json"))
+	t.Cleanup(closeServer)
+	adapter.cfg.InterfacePreference = "dnsweaver"
+	adapter.cfg.AllowedInterfaces = []string{"eth0"}
+
+	workloads, err := adapter.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("tagged interface ListWorkloads: %v", err)
+	}
+	if len(workloads) != 1 {
+		t.Fatalf("workload count = %d, want 1", len(workloads))
+	}
+	if _, exists := workloads[0].Metadata[metaKeyIP]; exists {
+		t.Fatalf("tagged interface without an address fell back to allow-listed eth0: %+v", workloads[0].Metadata)
+	}
+	if got := workloads[0].Metadata["proxmox.lifecycle.state"]; got != LifecycleStateSuccessfulEmpty {
+		t.Fatalf("lifecycle state = %q, want successful empty qualified address", got)
+	}
+}
+
+func TestStatefulLifecycleIPv6OnlyRetainsAddressWhenOnlyIPv4IsObserved(t *testing.T) {
+	fixture := &lifecycleTestServer{
+		resources:  []ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning}},
+		interfaces: []AgentNetworkInterface{{Name: "eth0", IPAddresses: []AgentIPAddress{{IPAddress: "fd00::10"}}}},
+	}
+	server, client := newTestServer(t, fixture.handler)
+	t.Cleanup(server.Close)
+	adapter := NewWorkloadListerAdapter(client, AdapterConfig{
+		LifecycleMode:               LifecycleModeStateful,
+		LifecycleStateFile:          filepath.Join(t.TempDir(), "lifecycle.json"),
+		LifecycleScopeConfirmed:     true,
+		LifecycleDeleteObservations: 2,
+		IPVersion:                   IPVersionIPv6,
+		VMZone:                      "example.com",
+	}, testLogger())
+
+	workloads, err := adapter.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("initial IPv6 ListWorkloads: %v", err)
+	}
+	if len(workloads) != 1 || workloads[0].Metadata[metaKeyIP6] != "fd00::10" {
+		t.Fatalf("initial IPv6 workload = %+v, want fd00::10", workloads)
+	}
+
+	fixture.interfaces = []AgentNetworkInterface{{Name: "eth0", IPAddresses: []AgentIPAddress{{IPAddress: "10.20.0.10"}}}}
+	workloads, err = adapter.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("IPv4-only observation in IPv6 mode: %v", err)
+	}
+	if len(workloads) != 1 || workloads[0].Metadata[metaKeyIP6] != "fd00::10" {
+		t.Fatalf("IPv4-only observation dropped last confirmed IPv6: %+v", workloads)
+	}
+	if _, exists := workloads[0].Metadata[metaKeyIP]; exists {
+		t.Fatalf("IPv6-only workload exposed IPv4 address: %+v", workloads[0].Metadata)
+	}
+	if got := workloads[0].Metadata["proxmox.lifecycle.state"]; got != LifecycleStateSuccessfulEmpty {
+		t.Fatalf("lifecycle state = %q, want successful empty qualified address", got)
 	}
 }
 
@@ -439,6 +516,91 @@ func TestStatefulLifecycleClusterStatusFailureBlocksCleanup(t *testing.T) {
 	status := adapter.SnapshotStatus()
 	if status.Complete || status.AllowOrphanCleanup {
 		t.Fatalf("cluster status failure left cleanup enabled: %+v", status)
+	}
+}
+
+func TestProxmoxLegacyDefaultsToRunningAndStatefulRetainsStopped(t *testing.T) {
+	fixture := &lifecycleTestServer{
+		resources: []ClusterResource{
+			{VMID: 100, Name: "running", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning},
+			{VMID: 101, Name: "stopped", Node: "pve-00", Type: resourceTypeQEMU, Status: "stopped"},
+		},
+		interfaces: []AgentNetworkInterface{{Name: "eth0", IPAddresses: []AgentIPAddress{{IPAddress: "10.20.0.10"}}}},
+	}
+	server, client := newTestServer(t, fixture.handler)
+	t.Cleanup(server.Close)
+
+	legacy := NewWorkloadListerAdapter(client, AdapterConfig{}, testLogger())
+	legacyWorkloads, err := legacy.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("legacy ListWorkloads: %v", err)
+	}
+	if len(legacyWorkloads) != 1 || legacyWorkloads[0].Name != "running" {
+		t.Fatalf("legacy workloads = %+v, want only the running resource", legacyWorkloads)
+	}
+
+	stateful := NewWorkloadListerAdapter(client, AdapterConfig{
+		LifecycleMode:           LifecycleModeStateful,
+		LifecycleStateFile:      filepath.Join(t.TempDir(), "state.json"),
+		LifecycleScopeConfirmed: true,
+		StateFilter:             stateRunning,
+		VMZone:                  "example.com",
+	}, testLogger())
+	statefulWorkloads, err := stateful.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("stateful ListWorkloads: %v", err)
+	}
+	if len(statefulWorkloads) != 2 {
+		t.Fatalf("stateful workloads = %+v, want running and stopped resources", statefulWorkloads)
+	}
+	for _, current := range statefulWorkloads {
+		if current.Name == "stopped" && current.Metadata["proxmox.lifecycle.state"] != LifecycleStateStopped {
+			t.Fatalf("stopped lifecycle state = %q, want %q", current.Metadata["proxmox.lifecycle.state"], LifecycleStateStopped)
+		}
+	}
+}
+
+func TestLifecyclePostRenameSyncFailureDoesNotResurrectDeletedAddress(t *testing.T) {
+	fixture := statefulQEMUFixture()
+	stateFile := filepath.Join(t.TempDir(), "lifecycle.json")
+	adapter, closeServer := newStatefulTestAdapter(t, fixture, stateFile)
+	t.Cleanup(closeServer)
+	ctx := context.Background()
+	if workloads, err := adapter.ListWorkloads(ctx); err != nil || len(workloads) != 1 || workloads[0].Metadata[metaKeyIP] != "10.20.0.10" {
+		t.Fatalf("initial ListWorkloads = %+v, err=%v", workloads, err)
+	}
+
+	fixture.resources = nil
+	if _, err := adapter.ListWorkloads(ctx); err != nil {
+		t.Fatalf("first absent observation: %v", err)
+	}
+	originalSync := adapter.store.fileOps.syncDirectory
+	adapter.store.fileOps.syncDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	if _, err := adapter.ListWorkloads(ctx); err == nil {
+		t.Fatal("directory sync failure after rename was reported as a successful observation")
+	}
+	adapter.store.fileOps.syncDirectory = originalSync
+
+	diskState, err := newLifecycleStore(stateFile).snapshot()
+	if err != nil {
+		t.Fatalf("reload renamed state file: %v", err)
+	}
+	key := "test-cluster|qemu|100"
+	if _, exists := diskState.Instances[key]; exists || diskState.Tombstones[key] == 0 {
+		t.Fatalf("rename did not persist the confirmed deletion: instances=%+v tombstones=%+v", diskState.Instances, diskState.Tombstones)
+	}
+
+	fixture.resources = []ClusterResource{{VMID: 100, Name: "web", Node: "pve-00", Type: resourceTypeQEMU, Status: stateRunning}}
+	fixture.agentError = true
+	workloads, err := adapter.ListWorkloads(ctx)
+	if err != nil {
+		t.Fatalf("reappearance after failed directory sync: %v", err)
+	}
+	if len(workloads) != 1 {
+		t.Fatalf("reappeared workloads = %+v, want one new generation", workloads)
+	}
+	if got := workloads[0].Metadata[metaKeyIP]; got != "" {
+		t.Fatalf("reappeared VMID inherited deleted address %q after post-rename failure", got)
 	}
 }
 

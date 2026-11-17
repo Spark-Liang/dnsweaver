@@ -8,6 +8,7 @@ import (
 
 	"github.com/maxfield-allison/dnsweaver/internal/target"
 	"github.com/maxfield-allison/dnsweaver/pkg/provider"
+	"github.com/maxfield-allison/dnsweaver/pkg/source"
 )
 
 // validateConfig performs cross-field validation on the complete configuration.
@@ -82,13 +83,24 @@ func validateConfig(cfg *Config) []*ConfigError {
 			"DNSWEAVER_PROXMOX_LIFECYCLE_MODE=stateful",
 		))
 	}
-	if cfg.Global.ProxmoxLifecycleMode == "stateful" && strings.Trim(strings.TrimSpace(cfg.Global.ProxmoxVMZone), ".") == "" {
-		errs = append(errs, configErrFull(
-			"proxmox.vm_zone",
-			"is required when proxmox.lifecycle_mode is stateful",
-			"Stateful DNS names are <PVE name>.<cluster name>.<vm zone>; the zone is deployment-specific and is not reported by PVE",
-			"DNSWEAVER_PROXMOX_VM_ZONE=example.com",
-		))
+	if cfg.Global.ProxmoxLifecycleMode == "stateful" {
+		vmZone := strings.Trim(strings.TrimSpace(cfg.Global.ProxmoxVMZone), ".")
+		switch {
+		case vmZone == "":
+			errs = append(errs, configErrFull(
+				"proxmox.vm_zone",
+				"is required when proxmox.lifecycle_mode is stateful",
+				"Stateful DNS names are <PVE name>.<cluster name>.<vm zone>; the zone is deployment-specific and is not reported by PVE",
+				"DNSWEAVER_PROXMOX_VM_ZONE=example.com",
+			))
+		case source.ValidateHostname("vm."+vmZone) != nil:
+			errs = append(errs, configErrFull(
+				"proxmox.vm_zone",
+				"must be a valid DNS suffix",
+				"Stateful DNS names are <PVE name>.<cluster name>.<vm zone>",
+				"DNSWEAVER_PROXMOX_VM_ZONE=example.com",
+			))
+		}
 	}
 	if cfg.Global.ProxmoxLifecycleDeleteObservations < 1 {
 		errs = append(errs, configErrFull(

@@ -13,33 +13,33 @@ import (
 
 // Global configuration defaults.
 const (
-	DefaultLogLevel             = "info"
-	DefaultLogFormat            = "json"
-	DefaultLogMaxSize           = 100  // megabytes
-	DefaultLogMaxBackups        = 5    // number of old log files to keep
-	DefaultLogMaxAge            = 30   // days to retain old logs
-	DefaultLogCompress          = true // compress rotated log files
-	DefaultDryRun               = false
-	DefaultCleanupOrphans       = true
-	DefaultCleanupOnStop        = true
-	DefaultOwnershipTracking    = true
-	DefaultOwnershipStorage     = "legacy"
-	DefaultAdoptExisting        = false
-	DefaultTTL                  = 300
-	DefaultReconcileInterval    = 60 * time.Second
-	DefaultShutdownTimeout      = 30 * time.Second
-	DefaultHealthPort           = 8080
-	DefaultHealthAddress        = "127.0.0.1"
-	DefaultHealthAllowNetwork   = false
-	DefaultDockerHost           = "unix:///var/run/docker.sock"
-	DefaultDockerMode           = "auto"
-	DefaultDockerConnectTimeout = 30 * time.Second
-	DefaultSource               = "traefik"
-	DefaultInstanceID           = ""
-	DefaultPlatform             = "docker"
+	DefaultLogLevel                           = "info"
+	DefaultLogFormat                          = "json"
+	DefaultLogMaxSize                         = 100  // megabytes
+	DefaultLogMaxBackups                      = 5    // number of old log files to keep
+	DefaultLogMaxAge                          = 30   // days to retain old logs
+	DefaultLogCompress                        = true // compress rotated log files
+	DefaultDryRun                             = false
+	DefaultCleanupOrphans                     = true
+	DefaultCleanupOnStop                      = true
+	DefaultOwnershipTracking                  = true
+	DefaultOwnershipStorage                   = "legacy"
+	DefaultAdoptExisting                      = false
+	DefaultTTL                                = 300
+	DefaultReconcileInterval                  = 60 * time.Second
+	DefaultShutdownTimeout                    = 30 * time.Second
+	DefaultHealthPort                         = 8080
+	DefaultHealthAddress                      = "127.0.0.1"
+	DefaultHealthAllowNetwork                 = false
+	DefaultDockerHost                         = "unix:///var/run/docker.sock"
+	DefaultDockerMode                         = "auto"
+	DefaultDockerConnectTimeout               = 30 * time.Second
+	DefaultSource                             = "traefik"
+	DefaultInstanceID                         = ""
+	DefaultPlatform                           = "docker"
 	DefaultProxmoxLifecycleMode               = "legacy"
-	DefaultProxmoxLifecycleStateFile         = "proxmox-lifecycle.json"
-	DefaultProxmoxLifecycleScopeConfirmed    = false
+	DefaultProxmoxLifecycleStateFile          = "proxmox-lifecycle.json"
+	DefaultProxmoxLifecycleScopeConfirmed     = false
 	DefaultProxmoxLifecycleDeleteObservations = 2
 )
 
@@ -96,24 +96,24 @@ type GlobalConfig struct {
 	Source string // traefik, labels, or custom source name
 
 	// Proxmox VE settings
-	ProxmoxURL                string   // PVE API base URL (e.g., https://pve-00:8006)
-	ProxmoxTokenID            string   // PVE API token ID (e.g., user@pam!dnsweaver)
-	ProxmoxTokenSecret        string   // PVE API token secret (UUID); supports _FILE suffix
-	ProxmoxNodeFilter         string   // Optional: limit to a specific node (empty = all nodes)
-	ProxmoxTagFilter          string   // Optional: prefix match on PVE tags to filter workloads
-	ProxmoxStateFilter        string   // Filter by PVE resource status (default: "running")
-	ProxmoxDomainSuffix       string   // Domain suffix to append to VM names (e.g., "home.example.com")
-	ProxmoxVMZone             string   // Final DNS zone for stateful names: <name>.<cluster>.<zone>
-	ProxmoxHostnameTagPrefix  string   // Optional: tag prefix for hostname override tags (e.g. "dnsweaver")
-	ProxmoxInterfaceTagPrefix string   // Optional: tag prefix for interface selection tags (e.g. "dnsweaver")
-	ProxmoxAllowedInterfaces  []string // Optional allow-list of guest interface names for IP resolution
-	ProxmoxVerifyTLS          bool     // Verify TLS certificate on PVE API endpoint (DEPRECATED in v1.5: prefer ProxmoxTLSSkipVerify)
-	ProxmoxTargetMode         string   // Target resolution mode: "guest-ip" (default) or "instance"
-	ProxmoxIPVersion          string   // Address families to resolve: "ipv4" (default), "ipv6", or "dual"
-	ProxmoxLifecycleMode      string   // "legacy" (default) or "stateful"
-	ProxmoxLifecycleStateFile string   // Persisted state path for stateful mode
-	ProxmoxLifecycleScopeConfirmed bool // Explicitly confirm complete PVE inventory scope
-	ProxmoxLifecycleDeleteObservations int // Consecutive absent snapshots before deletion
+	ProxmoxURL                         string   // PVE API base URL (e.g., https://pve-00:8006)
+	ProxmoxTokenID                     string   // PVE API token ID (e.g., user@pam!dnsweaver)
+	ProxmoxTokenSecret                 string   // PVE API token secret (UUID); supports _FILE suffix
+	ProxmoxNodeFilter                  string   // Optional: limit to a specific node (empty = all nodes)
+	ProxmoxTagFilter                   string   // Optional: prefix match on PVE tags to filter workloads
+	ProxmoxStateFilter                 string   // Filter by PVE resource status (default: "running")
+	ProxmoxDomainSuffix                string   // Domain suffix to append to VM names (e.g., "home.example.com")
+	ProxmoxVMZone                      string   // Final DNS zone for stateful names: <name>.<cluster>.<zone>
+	ProxmoxHostnameTagPrefix           string   // Optional: tag prefix for hostname override tags (e.g. "dnsweaver")
+	ProxmoxInterfaceTagPrefix          string   // Optional: tag prefix for interface selection tags (e.g. "dnsweaver")
+	ProxmoxAllowedInterfaces           []string // Optional allow-list of guest interface names for IP resolution
+	ProxmoxVerifyTLS                   bool     // Verify TLS certificate on PVE API endpoint (DEPRECATED in v1.5: prefer ProxmoxTLSSkipVerify)
+	ProxmoxTargetMode                  string   // Target resolution mode: "guest-ip" (default) or "instance"
+	ProxmoxIPVersion                   string   // Address families to resolve: "ipv4" (default), "ipv6", or "dual"
+	ProxmoxLifecycleMode               string   // "legacy" (default) or "stateful"
+	ProxmoxLifecycleStateFile          string   // Persisted state path for stateful mode
+	ProxmoxLifecycleScopeConfirmed     bool     // Explicitly confirm complete PVE inventory scope
+	ProxmoxLifecycleDeleteObservations int      // Consecutive absent snapshots before deletion
 
 	// Unified PVE TLS configuration (v1.5+). Populated from DNSWEAVER_PROXMOX_TLS_*
 	// env vars and consumed by internal/proxmox via httputil.TLSConfig.

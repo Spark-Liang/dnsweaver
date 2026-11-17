@@ -63,11 +63,11 @@ func ParseTargetMode(s string) (TargetMode, error) {
 
 // Proxmox implements the source.Source interface for Proxmox VE workloads.
 type Proxmox struct {
-	domain                string
-	targetMode            TargetMode
-	hostnameTagPrefix     string
-	vmZone                string
-	logger                *slog.Logger
+	domain            string
+	targetMode        TargetMode
+	hostnameTagPrefix string
+	vmZone            string
+	logger            *slog.Logger
 }
 
 // Option is a functional option for configuring Proxmox.

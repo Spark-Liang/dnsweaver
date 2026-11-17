@@ -1,0 +1,270 @@
+package reconciler
+
+import (
+	"log/slog"
+
+	"github.com/maxfield-allison/dnsweaver/pkg/provider"
+	"github.com/maxfield-allison/dnsweaver/pkg/source"
+)
+
+func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
+	statefulClaims map[string][]*source.Hostname,
+	cache *recordCache,
+) map[string]struct{} {
+	blocked := make(map[string]struct{})
+	if !r.config.OwnershipTracking || cache == nil {
+		return blocked
+	}
+
+	claimsByName := make(map[string][]*source.Hostname, len(statefulClaims))
+	for hostname, claims := range statefulClaims {
+		claimsByName[source.NormalizeHostname(hostname)] = append(claimsByName[source.NormalizeHostname(hostname)], claims...)
+	}
+	pendingByName := make(map[string][]memberOwnershipRepair)
+	r.mu.RLock()
+	for _, repair := range r.pendingMemberOwnership {
+		normalized := source.NormalizeHostname(repair.Record.Hostname)
+		pendingByName[normalized] = append(pendingByName[normalized], repair)
+		if repair.StatefulProxmox {
+			if _, exists := claimsByName[normalized]; !exists {
+				claimsByName[normalized] = []*source.Hostname{{Name: repair.Record.Hostname}}
+			}
+		}
+	}
+	for key, recovery := range r.pendingReplacements {
+		if !recovery.StatefulProxmox {
+			continue
+		}
+		normalized := source.NormalizeHostname(key.Hostname)
+		if _, exists := claimsByName[normalized]; !exists {
+			claimsByName[normalized] = []*source.Hostname{{Name: key.Hostname}}
+		}
+	}
+	r.mu.RUnlock()
+	previous := r.previousDesiredSnapshot()
+
+	for hostname, claims := range claimsByName {
+		normalized := source.NormalizeHostname(hostname)
+		instances := make(map[string]*provider.ProviderInstance)
+		pendingMemberRecords := make(map[provider.ProviderIdentity][]provider.Record, len(pendingByName[normalized]))
+		for _, repair := range pendingByName[normalized] {
+			pendingMemberRecords[repair.Instance.Identity] = append(pendingMemberRecords[repair.Instance.Identity], repair.Record)
+		}
+		adoptionAllowed := true
+		hasWriter := false
+
+		for _, claim := range claims {
+			candidates, _ := r.providersForClaim(claim)
+			for _, instance := range candidates {
+				hasWriter = true
+				instances[instance.Name()] = instance
+				if !r.effectiveAdoptExisting(claim, instance) {
+					adoptionAllowed = false
+				}
+			}
+		}
+
+		r.mu.RLock()
+		for key, recovery := range r.pendingReplacements {
+			if key.Hostname == normalized {
+				instances[recovery.Instance.Name()] = recovery.Instance
+				hasWriter = true
+				if !effectiveProviderAdoption(r, recovery.Instance) {
+					adoptionAllowed = false
+				}
+			}
+		}
+		r.mu.RUnlock()
+		for _, repair := range pendingByName[normalized] {
+			instances[repair.Instance.Name()] = repair.Instance
+			hasWriter = true
+			if !effectiveProviderAdoption(r, repair.Instance) {
+				adoptionAllowed = false
+			}
+		}
+
+		if !hasWriter || adoptionAllowed {
+			continue
+		}
+
+		for _, instance := range r.providers.All() {
+			instances[instance.Name()] = instance
+		}
+		unowned := false
+		for _, instance := range instances {
+			records, available := cache.getAllDataRecordsForHostname(instance.Name(), normalized)
+			if !available {
+				if instance.Matches(normalized) || hasPendingRoute(r, normalized, instance.Identity) {
+					unowned = true
+					break
+				}
+				continue
+			}
+			_, hasLegacyOwner := cache.legacyOwnershipRecord(instance.Name(), normalized, instance.InstanceID)
+			for _, record := range records {
+				if _, owned := cache.memberOwnershipRecord(instance.Name(), record, instance.InstanceID); owned {
+					continue
+				}
+				if pendingOwnershipRepairMatches(instance, record, pendingMemberRecords[instance.Identity]) {
+					continue
+				}
+				if !instance.Provider.Capabilities().SupportsOwnershipTXT && previousDesiredMemberMatches(previous, instance, record) {
+					continue
+				}
+				// A legacy hostname marker can still prove a single old-style
+				// member. It cannot prove that later siblings were not added by an
+				// operator, so mixed/multi-member names remain frozen. Legacy markers
+				// never authorized MX or NS records.
+				if hasLegacyOwner && len(records) == 1 && legacyOwnershipCovers(record.Type) {
+					continue
+				}
+				unowned = true
+				break
+			}
+			if unowned {
+				break
+			}
+		}
+		if unowned {
+			blocked[normalized] = struct{}{}
+			r.warnOnce("stateful-unowned-name|"+normalized,
+				"freezing stateful Proxmox DNS name because unowned provider records exist",
+				slog.String("hostname", normalized),
+			)
+		}
+	}
+	return blocked
+}
+
+func (r *Reconciler) hasStatefulPendingOwnershipRepairs() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, repair := range r.pendingMemberOwnership {
+		if repair.StatefulProxmox {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Reconciler) hasStatefulPendingReplacementRecoveries() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, recovery := range r.pendingReplacements {
+		if recovery.StatefulProxmox {
+			return true
+		}
+	}
+	return false
+}
+
+func previousDesiredMemberMatches(
+	previous map[desiredSetKey]previousDesiredSet,
+	instance *provider.ProviderInstance,
+	current provider.Record,
+) bool {
+	for key, set := range previous {
+		if key.Identity != instance.Identity || key.Hostname != source.NormalizeHostname(current.Hostname) || set.ProviderName != instance.Name() {
+			continue
+		}
+		for _, expected := range set.Records {
+			if provider.SameRecordMember(current, expected) && current.TTL == expected.TTL && !instance.RecordNeedsUpdate(current, expected) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pendingOwnershipRepairMatches(
+	instance *provider.ProviderInstance,
+	current provider.Record,
+	pending []provider.Record,
+) bool {
+	for _, expected := range pending {
+		if !provider.SameRecordMember(current, expected) || current.TTL != expected.TTL {
+			continue
+		}
+		if !instance.RecordNeedsUpdate(current, expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func effectiveProviderAdoption(r *Reconciler, instance *provider.ProviderInstance) bool {
+	adopt := r.config.AdoptExisting
+	if instance.AdoptExisting != nil {
+		adopt = *instance.AdoptExisting
+	}
+	return adopt
+}
+
+func hasPendingRoute(r *Reconciler, hostname string, identity provider.ProviderIdentity) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key := range r.pendingReplacements {
+		if key.Identity == identity && key.Hostname == hostname {
+			return true
+		}
+	}
+	for key, repair := range r.pendingMemberOwnership {
+		if key.Identity == identity && source.NormalizeHostname(repair.Record.Hostname) == hostname {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Reconciler) heldReplacementRoutes(
+	blockedNames map[string]struct{},
+	rejected map[replacementKey]struct{},
+) map[replacementKey]struct{} {
+	held := make(map[replacementKey]struct{}, len(blockedNames)+len(rejected))
+	for key := range rejected {
+		held[key] = struct{}{}
+	}
+	for hostname := range blockedNames {
+		normalized := source.NormalizeHostname(hostname)
+		for _, instance := range r.providers.All() {
+			if instance.Matches(normalized) {
+				held[replacementKey{Identity: instance.Identity, Hostname: normalized}] = struct{}{}
+			}
+		}
+	}
+
+	r.mu.Lock()
+	for key := range r.pendingReplacements {
+		if _, blocked := blockedNames[source.NormalizeHostname(key.Hostname)]; blocked {
+			held[key] = struct{}{}
+		}
+	}
+	for key, repair := range r.pendingMemberOwnership {
+		hostname := source.NormalizeHostname(repair.Record.Hostname)
+		if _, blocked := blockedNames[hostname]; blocked {
+			held[replacementKey{Identity: key.Identity, Hostname: hostname}] = struct{}{}
+		}
+	}
+	r.mu.Unlock()
+	return held
+}
+
+func (r *Reconciler) blockedOwnershipIdentities(
+	blockedNames map[string]struct{},
+	held map[replacementKey]struct{},
+) map[provider.ProviderIdentity]struct{} {
+	blocked := make(map[provider.ProviderIdentity]struct{})
+	for key := range held {
+		if _, frozen := blockedNames[source.NormalizeHostname(key.Hostname)]; frozen {
+			blocked[key.Identity] = struct{}{}
+		}
+	}
+	for hostname := range blockedNames {
+		for _, instance := range r.providers.All() {
+			if instance.Matches(hostname) {
+				blocked[instance.Identity] = struct{}{}
+			}
+		}
+	}
+	return blocked
+}
