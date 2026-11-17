@@ -469,15 +469,20 @@ func (c *Client) get(ctx context.Context, path string, dst any) error {
 
 	if resp.StatusCode == http.StatusInternalServerError {
 		// PVE returns 500 when the guest agent is not running.
-		// Attempt to detect this specific case from the error message.
+		// Depending on the endpoint/version, the error is either in an
+		// errors-map entry or the top-level message field.
 		var errResp struct {
-			Errors map[string]string `json:"errors"`
+			Errors  map[string]string `json:"errors"`
+			Message string            `json:"message"`
 		}
 		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil {
 			for _, msg := range errResp.Errors {
 				if containsAgentError(msg) {
 					return parseAgentNotRunning(path)
 				}
+			}
+			if containsAgentError(errResp.Message) {
+				return parseAgentNotRunning(path)
 			}
 		}
 	}
