@@ -247,7 +247,10 @@ func (a *WorkloadListerAdapter) listLegacy(ctx context.Context) ([]workload.Work
 func (a *WorkloadListerAdapter) SnapshotStatus() workload.SnapshotStatus {
 	a.snapshotMu.RLock()
 	defer a.snapshotMu.RUnlock()
-	return a.snapshot
+	status := a.snapshot
+	status.BlockedHostnames = append([]string(nil), status.BlockedHostnames...)
+	status.RetiredHostnames = append([]string(nil), status.RetiredHostnames...)
+	return status
 }
 
 func (a *WorkloadListerAdapter) setSnapshot(status workload.SnapshotStatus) {
@@ -296,6 +299,19 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 	if len(snapshot.Resources) > 0 {
 		next.ObservedNonEmpty = true
 	}
+	for key, record := range next.Instances {
+		if record.Key == "" {
+			record.Key = key
+		}
+		if record.Hostname == "" {
+			record.Hostname = a.lifecycleName(
+				ClusterResource{Name: record.Name, Type: record.Type, VMID: record.VMID},
+				record.ClusterName,
+			)
+		}
+		next.Instances[key] = record
+		rememberLifecycleName(&next, record)
+	}
 
 	resources := make([]ClusterResource, 0, len(snapshot.Resources))
 	inventoryObserved := make(map[string]struct{}, len(snapshot.Resources))
@@ -327,6 +343,7 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 	workloads := make([]workload.Workload, 0, len(resources)+len(state.Instances))
 	for _, resource := range resources {
 		key := lifecycleIdentity(clusterName, resource)
+		hostname := a.lifecycleName(resource, clusterName)
 
 		record, exists := next.Instances[key]
 		if !exists {
@@ -343,20 +360,28 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 			// A name change on a reused VMID is treated as a new generation. A
 			// legitimate rename may briefly re-learn its address, which is safer
 			// than publishing an address belonging to the previous instance.
+			rememberLifecycleName(&next, record)
 			record.Generation++
 			record.LastIPs = ResolvedIPs{}
 			record.LastConfirmedAt = time.Time{}
+		} else if record.Hostname != "" && record.Hostname != hostname {
+			// A VM_ZONE change creates a different desired name even when the
+			// Proxmox identity and resource name stay the same. Keep the old FQDN
+			// for safety checks and remember the newly observed name separately.
+			rememberLifecycleName(&next, record)
 		}
 
 		record.Key = key
 		record.VMID = resource.VMID
 		record.Type = resource.Type
 		record.Name = resource.Name
+		record.Hostname = hostname
 		record.Node = resource.Node
 		record.ClusterName = clusterName
 		record.LastSeenAt = now
 		record.MissingObservations = 0
 		record.Collision = false
+		rememberLifecycleName(&next, record)
 
 		effectiveIPs, baseStatus, err := a.observeResource(ctx, resource, record)
 		if err != nil {
@@ -393,6 +418,7 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 			record.MissingObservations++
 			record.Status = LifecycleStateAbsentPending
 			if record.MissingObservations >= a.cfg.LifecycleDeleteObservations {
+				rememberLifecycleName(&next, record)
 				generation := record.Generation
 				if generation == 0 {
 					generation = 1
@@ -450,8 +476,23 @@ func (a *WorkloadListerAdapter) listStateful(ctx context.Context) ([]workload.Wo
 		Complete:           true,
 		AllowOrphanCleanup: a.cfg.LifecycleScopeConfirmed && next.ObservedNonEmpty && !uncertain,
 		BlockedHostnames:   sortedNames(collisionNames),
+		RetiredHostnames:   a.retiredHostnames(next),
 	})
 	return workloads, nil
+}
+
+func (a *WorkloadListerAdapter) retiredHostnames(state lifecycleFile) []string {
+	names := make(map[string]struct{}, len(state.RetiredNames))
+	for _, retired := range state.RetiredNames {
+		hostname := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(retired.Hostname), "."))
+		if hostname == "" {
+			hostname = a.lifecycleName(ClusterResource{Name: retired.Name, Type: retired.Type, VMID: retired.VMID}, retired.ClusterName)
+		}
+		if hostname != "" {
+			names[hostname] = struct{}{}
+		}
+	}
+	return sortedNames(names)
 }
 
 func (a *WorkloadListerAdapter) observeResource(ctx context.Context, resource ClusterResource, record lifecycleRecord) (ResolvedIPs, string, error) {

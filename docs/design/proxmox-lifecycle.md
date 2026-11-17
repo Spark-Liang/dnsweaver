@@ -34,7 +34,14 @@ The node and the display name are attributes, not identity. A node migration
 therefore keeps the same key and last-confirmed address. A name change for the
 same key starts a new generation and clears the old address before a new
 address is confirmed. Confirmed deletion leaves a generation tombstone so a
-later VMID reuse cannot inherit the old address.
+later VMID reuse cannot inherit the old address. Schema 2 retains each concrete
+DNS hostname by lifecycle generation after the active instance is removed; the
+name remains available for same-name ownership preflight across restarts and
+later `VM_ZONE` changes. Schema 1 active and absent-pending records derive and
+persist their hostname using the configuration in effect when the adapter first
+reads them. If `VM_ZONE` changed before that migration, the old zone cannot be
+recovered from the schema 1 fields. A schema 1 file containing only a generation
+tombstone has no recoverable name, so the adapter does not invent one.
 
 The generation is only a local counter; it is not an instance fingerprint
 reported or verifiable by PVE. If a VMID is reused with the same name before a
@@ -106,9 +113,14 @@ The reconciler consumes the optional lister snapshot status and suppresses
 member removals while the Proxmox snapshot is incomplete or lifecycle state is
 uncertain. A restarted reconciler must call its existing `RecoverOwnership`
 startup hook so provider ownership markers repopulate the in-memory orphan
-state; the lifecycle JSON persists the deletion observation and tombstone
-independently. This is a conservative cycle-wide removal gate in this first
-slice; it does not alter source/provider behavior in legacy mode.
+state; the lifecycle JSON persists the deletion observation, tombstone, and
+retired DNS names independently. Retired names are checked against providers
+whose configured domains match the historical hostname, even when no current
+claim or ownership marker remains. This may conservatively freeze an unowned
+same-name record on a matching backend. Retired names are retained in the state
+file; this first slice has no automatic pruning protocol. This is a conservative
+cycle-wide removal gate and does not alter source/provider behavior in legacy
+mode.
 
 ## Name collision freeze
 
@@ -128,8 +140,8 @@ confirmed deleted or is outside the configured management filters.
 With ownership tracking enabled and effective adoption disabled, a stateful
 Proxmox name is frozen when the provider snapshot contains any member without
 matching ownership evidence. Preflight includes current claims, prior stateful
-desired sets, durable stateful member ownership markers, and pending recovery or
-repair names. The stateful source continues to trigger preflight for an empty
+desired sets, durable stateful member ownership markers, lifecycle-retired
+names, and pending recovery or repair names. The stateful source continues to trigger preflight for an empty
 inventory so a confirmed deletion cannot bypass the same-name RRset check. For
 providers without ownership TXT support, an exact member from this process's
 previous desired set is also evidence of local ownership; that evidence is
@@ -147,14 +159,21 @@ HTTPS), and only when it is the sole data member at the name; it cannot
 authorize CAA, MX, NS, or other types.
 
 Technitium's default automatic HTTPS companion is covered by related-record
-ownership metadata only when dnsweaver created the companion during the same
-provider operation. That provenance is stored on the parent address member's
-durable ownership marker and follows an address replacement at the name. A
-same-shaped manual HTTPS record without that evidence remains unowned and freezes
-the name. Automatic companions created before this metadata existed also remain
-unowned after restart and may require operator review; the implementation does
-not infer ownership from record shape. Uncontested names continue to reconcile
-even when lifecycle orphan cleanup is not enabled by the PVE scope declaration.
+ownership metadata only when dnsweaver created it and verified the created
+member by reading it back. The parent address member's durable ownership marker
+stores a SHA-256 fingerprint of the companion hostname, TTL, target, priority,
+target name, and ALPN. The fingerprint follows address replacement only when
+the provider observes the same companion content. A modified companion fails
+that comparison and freezes the entire name, including address, ownership,
+repair, retry, and cleanup writes. A same-shaped manual HTTPS record without
+creation-and-read-back evidence remains unowned. Earlier boolean-only markers
+and companions created before content fingerprints existed do not prove
+ownership and remain frozen for review; the implementation does not infer
+ownership from record shape or migrate that evidence. When an ownership TXT
+write fails after verified companion creation, the pending repair retains the
+fingerprint and can retry only while the observed companion still matches.
+Uncontested names continue to reconcile even when lifecycle orphan cleanup is
+not enabled by the PVE scope declaration.
 
 Provider ownership migration is backend-scoped rather than name-scoped. While
 a stateful name is frozen, migration is held for that backend to prevent a

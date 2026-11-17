@@ -10,17 +10,23 @@ import (
 )
 
 func TestCompanionLifecycle(t *testing.T) {
+	created := false
 	// Mock server to validate add/delete companion calls
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/zones/records/get":
-			// Simulate no existing HTTPS records
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"status":"ok","response":{"zone":{"name":"zone"},"name":"app.example.com","records":[]}}`))
+			if created {
+				_, _ = w.Write([]byte(`{"status":"ok","response":{"zone":{"name":"zone"},"name":"app.example.com","records":[{"name":"app.example.com","type":"HTTPS","ttl":300,"rData":{"svcPriority":1,"svcTargetName":".","svcParams":"alpn|h2"}}]}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"status":"ok","response":{"zone":{"name":"zone"},"name":"app.example.com","records":[]}}`))
+			}
 		case "/api/zones/records/add":
+			created = true
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case "/api/zones/records/delete":
+			created = false
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		default:

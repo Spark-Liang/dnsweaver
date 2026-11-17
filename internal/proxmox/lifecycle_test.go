@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,15 @@ func statefulQEMUFixture() *lifecycleTestServer {
 }
 
 func newStatefulTestAdapter(t *testing.T, fixture *lifecycleTestServer, stateFile string) (*WorkloadListerAdapter, func()) {
+	return newStatefulTestAdapterWithZone(t, fixture, stateFile, "example.com")
+}
+
+func newStatefulTestAdapterWithZone(
+	t *testing.T,
+	fixture *lifecycleTestServer,
+	stateFile string,
+	vmZone string,
+) (*WorkloadListerAdapter, func()) {
 	t.Helper()
 	server, client := newTestServer(t, fixture.handler)
 	adapter := NewWorkloadListerAdapter(client, AdapterConfig{
@@ -91,7 +101,7 @@ func newStatefulTestAdapter(t *testing.T, fixture *lifecycleTestServer, stateFil
 		LifecycleScopeConfirmed:     true,
 		LifecycleDeleteObservations: 2,
 		DomainSuffix:                "example.com",
-		VMZone:                      "example.com",
+		VMZone:                      vmZone,
 	}, testLogger())
 	return adapter, server.Close
 }
@@ -623,6 +633,79 @@ func TestLifecycleStateFileCreatedWithPrivateMode(t *testing.T) {
 	}
 	if dirInfo.Mode().Perm() != 0o700 {
 		t.Fatalf("state directory mode = %o, want 700", dirInfo.Mode().Perm())
+	}
+}
+
+func TestLifecycleV1NameLessTombstoneDoesNotInventRetiredName(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "lifecycle.json")
+	legacyState := `{"schema":1,"instances":{},"tombstones":{"test-cluster|qemu|100":1},"observed_non_empty":true}`
+	if err := os.WriteFile(stateFile, []byte(legacyState), 0o600); err != nil {
+		t.Fatalf("write legacy tombstone-only state: %v", err)
+	}
+	fixture := statefulQEMUFixture()
+	fixture.resources = nil
+	adapter, closeServer := newStatefulTestAdapter(t, fixture, stateFile)
+	t.Cleanup(closeServer)
+
+	workloads, err := adapter.ListWorkloads(context.Background())
+	if err != nil {
+		t.Fatalf("ListWorkloads from legacy tombstone-only state: %v", err)
+	}
+	if len(workloads) != 0 {
+		t.Fatalf("tombstone-only state generated workloads: %+v", workloads)
+	}
+	if names := adapter.SnapshotStatus().RetiredHostnames; len(names) != 0 {
+		t.Fatalf("adapter invented a retired name absent from schema 1: %+v", names)
+	}
+
+	persisted, err := newLifecycleStore(stateFile).snapshot()
+	if err != nil {
+		t.Fatalf("reload upgraded state file: %v", err)
+	}
+	if persisted.Schema != lifecycleSchemaVersion || len(persisted.RetiredNames) != 0 || persisted.Tombstones["test-cluster|qemu|100"] != 1 {
+		t.Fatalf("tombstone-only migration fabricated identity data: %+v", persisted)
+	}
+}
+
+func TestStatefulRetiredHostnamePersistsAcrossVMZoneChange(t *testing.T) {
+	fixture := statefulQEMUFixture()
+	stateFile := filepath.Join(t.TempDir(), "lifecycle.json")
+	initial, closeInitial := newStatefulTestAdapter(t, fixture, stateFile)
+	t.Cleanup(closeInitial)
+	if _, err := initial.ListWorkloads(context.Background()); err != nil {
+		t.Fatalf("initial ListWorkloads: %v", err)
+	}
+	const previousHostname = "web.test-cluster.example.com"
+	if names := initial.SnapshotStatus().RetiredHostnames; !slices.Contains(names, previousHostname) {
+		t.Fatalf("initial lifecycle snapshot did not retain %q: %+v", previousHostname, names)
+	}
+	persisted, err := newLifecycleStore(stateFile).snapshot()
+	if err != nil {
+		t.Fatalf("read initial lifecycle state: %v", err)
+	}
+	persistedHostname := false
+	for _, retired := range persisted.RetiredNames {
+		if retired.Hostname == previousHostname {
+			persistedHostname = true
+			break
+		}
+	}
+	if !persistedHostname {
+		t.Fatalf("lifecycle file did not persist the concrete DNS hostname %q: %+v", previousHostname, persisted.RetiredNames)
+	}
+
+	fixture.resources = nil
+	reconfigured, closeReconfigured := newStatefulTestAdapterWithZone(t, fixture, stateFile, "new.example.net")
+	t.Cleanup(closeReconfigured)
+	if _, err := reconfigured.ListWorkloads(context.Background()); err != nil {
+		t.Fatalf("ListWorkloads after VM_ZONE change: %v", err)
+	}
+	names := reconfigured.SnapshotStatus().RetiredHostnames
+	if !slices.Contains(names, previousHostname) {
+		t.Fatalf("retired hostname changed when VM_ZONE changed: got %v, want retained %q", names, previousHostname)
+	}
+	if slices.Contains(names, "web.test-cluster.new.example.net") {
+		t.Fatalf("retired name was reconstructed using the new VM_ZONE: %+v", names)
 	}
 }
 

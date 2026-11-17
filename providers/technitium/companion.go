@@ -3,6 +3,9 @@ package technitium
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -24,44 +27,89 @@ const protectedCompanionState = "protected"
 const companionOwnershipMetadataKey = "dnsweaver.related.technitium-https"
 
 func (p *Provider) AddRelatedOwnershipMetadata(metadata map[string]string, related []provider.Record) map[string]string {
+	metadata = relatedOwnershipMetadata(metadata)
 	for _, record := range related {
-		if record.Type != provider.RecordTypeHTTPS || record.HTTPS == nil {
+		fingerprint, ok := relatedHTTPSFingerprint(record)
+		if !ok {
 			continue
 		}
 		if metadata == nil {
 			metadata = make(map[string]string)
-		} else {
-			metadata = cloneMetadata(metadata)
 		}
-		metadata[companionOwnershipMetadataKey] = "true"
+		metadata[companionOwnershipMetadataKey] = fingerprint
 		return metadata
 	}
 	return metadata
 }
 
 func (p *Provider) MergeRelatedOwnershipMetadata(metadata, previous map[string]string) map[string]string {
-	if previous[companionOwnershipMetadataKey] != "true" {
-		return metadata
+	metadata = relatedOwnershipMetadata(metadata)
+	if fingerprint := previous[companionOwnershipMetadataKey]; validRelatedHTTPSFingerprint(fingerprint) {
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
+		metadata[companionOwnershipMetadataKey] = fingerprint
 	}
-	metadata = cloneMetadata(metadata)
-	metadata[companionOwnershipMetadataKey] = "true"
 	return metadata
 }
 
 func (p *Provider) OwnsRelatedRecord(parent, related provider.Record, metadata map[string]string) bool {
-	if metadata[companionOwnershipMetadataKey] != "true" ||
-		(parent.Type != provider.RecordTypeA && parent.Type != provider.RecordTypeAAAA) ||
+	if (parent.Type != provider.RecordTypeA && parent.Type != provider.RecordTypeAAAA) ||
 		related.Type != provider.RecordTypeHTTPS || related.HTTPS == nil ||
-		!strings.EqualFold(strings.TrimSuffix(parent.Hostname, "."), strings.TrimSuffix(related.Hostname, ".")) ||
-		related.HTTPS.Priority != companionHTTPSSvcPriority || related.HTTPS.TargetName != companionHTTPSTargetName || related.HTTPS.ALPN == "" ||
-		parent.Metadata[companionStateKey] == protectedCompanionState {
+		!strings.EqualFold(strings.TrimSuffix(parent.Hostname, "."), strings.TrimSuffix(related.Hostname, ".")) {
 		return false
 	}
-	state, known := parent.Metadata[companionStateKey]
-	if !known {
-		return false
+	fingerprint, ok := relatedHTTPSFingerprint(related)
+	return ok && validRelatedHTTPSFingerprint(metadata[companionOwnershipMetadataKey]) &&
+		metadata[companionOwnershipMetadataKey] == fingerprint
+}
+
+type relatedHTTPSIdentity struct {
+	Hostname   string `json:"hostname"`
+	TTL        int    `json:"ttl"`
+	Target     string `json:"target"`
+	Priority   uint16 `json:"priority"`
+	TargetName string `json:"target_name"`
+	ALPN       string `json:"alpn"`
+}
+
+func relatedHTTPSFingerprint(record provider.Record) (string, bool) {
+	if record.Type != provider.RecordTypeHTTPS || record.HTTPS == nil {
+		return "", false
 	}
-	return state == strconv.Itoa(related.TTL)+":"+buildSvcParams(related.HTTPS.ALPN)
+	identity := relatedHTTPSIdentity{
+		Hostname:   strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Hostname), ".")),
+		TTL:        record.TTL,
+		Target:     record.Target,
+		Priority:   record.HTTPS.Priority,
+		TargetName: record.HTTPS.TargetName,
+		ALPN:       record.HTTPS.ALPN,
+	}
+	if identity.Hostname == "" {
+		return "", false
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return "", false
+	}
+	checksum := sha256.Sum256(encoded)
+	return hex.EncodeToString(checksum[:]), true
+}
+
+func validRelatedHTTPSFingerprint(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func relatedOwnershipMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	metadata = cloneMetadata(metadata)
+	if !validRelatedHTTPSFingerprint(metadata[companionOwnershipMetadataKey]) {
+		delete(metadata, companionOwnershipMetadataKey)
+	}
+	return metadata
 }
 
 func cloneMetadata(metadata map[string]string) map[string]string {
@@ -203,6 +251,17 @@ func (p *Provider) createCompanionHTTPSWithResult(ctx context.Context, hostname 
 		}
 		return provider.Record{}, false, fmt.Errorf("creating companion HTTPS record for %s: %w", hostname, err)
 	}
+	confirmedRecords, err := p.client.GetRecords(ctx, p.zone, hostname)
+	if err != nil {
+		return provider.Record{}, false, fmt.Errorf("verifying created companion HTTPS record for %s: %w", hostname, err)
+	}
+	confirmed, protected := companionHTTPS(confirmedRecords, hostname)
+	if protected || confirmed == nil || confirmed.TTL != ttl ||
+		confirmed.RData.SvcPriority != companionHTTPSSvcPriority ||
+		confirmed.RData.SvcTargetName != companionHTTPSTargetName ||
+		string(confirmed.RData.SvcParams) != svcParams {
+		return provider.Record{}, false, fmt.Errorf("verifying created companion HTTPS record for %s: read-back did not match the created member", hostname)
+	}
 
 	p.logger.Info("created companion HTTPS record",
 		slog.String("hostname", hostname),
@@ -213,12 +272,12 @@ func (p *Provider) createCompanionHTTPSWithResult(ctx context.Context, hostname 
 	return provider.Record{
 		Hostname: hostname,
 		Type:     provider.RecordTypeHTTPS,
-		Target:   companionHTTPSTargetName,
-		TTL:      ttl,
+		Target:   confirmed.RData.SvcTargetName,
+		TTL:      confirmed.TTL,
 		HTTPS: &provider.HTTPSData{
-			Priority:   companionHTTPSSvcPriority,
-			TargetName: companionHTTPSTargetName,
-			ALPN:       p.autoHTTPSALPN,
+			Priority:   uint16(min(max(0, confirmed.RData.SvcPriority), 65535)),
+			TargetName: confirmed.RData.SvcTargetName,
+			ALPN:       extractALPN(string(confirmed.RData.SvcParams)),
 		},
 	}, true, nil
 }

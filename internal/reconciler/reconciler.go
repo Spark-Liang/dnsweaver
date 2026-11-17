@@ -230,6 +230,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 	// Step 1: List all workloads from all platform listers
 	var allWorkloads []workload.Workload
 	blockedSnapshotNames := make(map[string]struct{})
+	statefulRetiredNames := make(map[string]struct{})
 	snapshotComplete := true
 	snapshotScopeConfirmed := true
 	statefulProxmoxSnapshot := false
@@ -254,6 +255,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 			}
 			for _, hostname := range status.BlockedHostnames {
 				blockedSnapshotNames[hostname] = struct{}{}
+			}
+			if status.StatefulProxmox {
+				for _, hostname := range status.RetiredHostnames {
+					statefulRetiredNames[source.NormalizeHostname(hostname)] = struct{}{}
+				}
 			}
 		}
 	}
@@ -290,12 +296,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*Result, error) {
 		compiled.BlockedNames[source.NormalizeHostname(hostname)] = struct{}{}
 	}
 	preflightNames := len(compiled.BlockedNames) > 0 || len(extracted.StatefulClaims) > 0 ||
-		statefulProxmoxSnapshot || r.hasStatefulPreviousDesired() ||
+		statefulProxmoxSnapshot || len(statefulRetiredNames) > 0 || r.hasStatefulPreviousDesired() ||
 		r.hasStatefulPendingOwnershipRepairs() || r.hasStatefulPendingReplacementRecoveries()
 	var cache *recordCache
 	if preflightNames {
 		cache = newRecordCacheWithUnmanaged(ctx, r.providers, r.logger, true)
-		for hostname := range r.blockStatefulNamesWithUnownedRecords(extracted.StatefulClaims, cache) {
+		for hostname := range r.blockStatefulNamesWithUnownedRecords(extracted.StatefulClaims, cache, statefulRetiredNames) {
 			compiled.BlockedNames[hostname] = struct{}{}
 		}
 	}

@@ -12,6 +12,7 @@ const statefulProxmoxOwnershipMetadataKey = "dnsweaver.stateful-proxmox"
 func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 	statefulClaims map[string][]*source.Hostname,
 	cache *recordCache,
+	retiredNames map[string]struct{},
 ) map[string]struct{} {
 	blocked := make(map[string]struct{})
 	if !r.config.OwnershipTracking || cache == nil {
@@ -39,6 +40,21 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 		}
 		if instance, exists := r.providers.Get(previousSet.ProviderName); exists {
 			addStatefulEvidence(key.Hostname, instance)
+		}
+	}
+	for hostname := range retiredNames {
+		normalized := source.NormalizeHostname(hostname)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := claimsByName[normalized]; !exists {
+			claimsByName[normalized] = nil
+		}
+		// Retired names come from the Proxmox lifecycle journal, but may no
+		// longer have an ownership marker or an in-memory desired set. Inspect
+		// only providers whose configured domains match that historical name.
+		for _, instance := range r.providers.MatchingProviders(normalized) {
+			addStatefulEvidence(normalized, instance)
 		}
 	}
 	for _, instance := range r.providers.All() {
@@ -143,7 +159,7 @@ func (r *Reconciler) blockStatefulNamesWithUnownedRecords(
 				if _, owned := cache.memberOwnershipRecord(instance.Name(), record, instance.InstanceID); owned {
 					continue
 				}
-				if ownsRelatedRecord(instance, records, record, cache) {
+				if ownsRelatedRecord(instance, records, record, cache, pendingMemberRecords[instance.Identity]) {
 					continue
 				}
 				if pendingOwnershipRepairMatches(instance, record, pendingMemberRecords[instance.Identity]) {
@@ -180,6 +196,7 @@ func ownsRelatedRecord(
 	records []provider.Record,
 	related provider.Record,
 	cache *recordCache,
+	pendingParents []provider.Record,
 ) bool {
 	owner, ok := instance.Provider.(provider.RelatedRecordOwnership)
 	if !ok {
@@ -189,13 +206,19 @@ func ownsRelatedRecord(
 		if parent.Type != provider.RecordTypeA && parent.Type != provider.RecordTypeAAAA {
 			continue
 		}
-		marker, owned := cache.memberOwnershipRecord(instance.Name(), parent, instance.InstanceID)
-		if !owned {
-			continue
+		if marker, owned := cache.memberOwnershipRecord(instance.Name(), parent, instance.InstanceID); owned {
+			_, _, _, metadata := provider.ParseMemberOwnershipValue(marker.Target)
+			if owner.OwnsRelatedRecord(parent, related, metadata) {
+				return true
+			}
 		}
-		_, _, _, metadata := provider.ParseMemberOwnershipValue(marker.Target)
-		if owner.OwnsRelatedRecord(parent, related, metadata) {
-			return true
+		for _, pending := range pendingParents {
+			if !provider.SameRecordMember(parent, pending) || parent.TTL != pending.TTL || instance.RecordNeedsUpdate(parent, pending) {
+				continue
+			}
+			if owner.OwnsRelatedRecord(parent, related, pending.Metadata) {
+				return true
+			}
 		}
 	}
 	return false

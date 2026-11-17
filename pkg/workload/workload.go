@@ -168,6 +168,10 @@ type SnapshotStatus struct {
 	// removals must be held for this cycle (for example, a Proxmox name
 	// collision). This is intentionally optional and platform-agnostic.
 	BlockedHostnames []string
+	// RetiredHostnames are names retained by a stateful lifecycle source after
+	// a resource stops claiming them. Reconciliation uses them only for
+	// same-name ownership preflight, not as desired workloads.
+	RetiredHostnames []string
 }
 
 // SnapshotStatusProvider is an optional lister capability used by sources

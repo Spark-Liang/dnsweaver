@@ -31,13 +31,14 @@ const (
 	LifecycleStateNameCollision    = "name-collision"
 )
 
-const lifecycleSchemaVersion = 1
+const lifecycleSchemaVersion = 2
 
 type lifecycleRecord struct {
 	Key                 string      `json:"key"`
 	VMID                int         `json:"vmid"`
 	Type                string      `json:"type"`
 	Name                string      `json:"name"`
+	Hostname            string      `json:"hostname,omitempty"`
 	Node                string      `json:"node"`
 	ClusterName         string      `json:"cluster_name,omitempty"`
 	Generation          uint64      `json:"generation"`
@@ -50,10 +51,21 @@ type lifecycleRecord struct {
 }
 
 type lifecycleFile struct {
-	Schema           int                        `json:"schema"`
-	Instances        map[string]lifecycleRecord `json:"instances"`
-	Tombstones       map[string]uint64          `json:"tombstones,omitempty"`
-	ObservedNonEmpty bool                       `json:"observed_non_empty"`
+	Schema           int                             `json:"schema"`
+	Instances        map[string]lifecycleRecord      `json:"instances"`
+	Tombstones       map[string]uint64               `json:"tombstones,omitempty"`
+	RetiredNames     map[string]lifecycleRetiredName `json:"retired_names,omitempty"`
+	ObservedNonEmpty bool                            `json:"observed_non_empty"`
+}
+
+type lifecycleRetiredName struct {
+	Key         string `json:"key"`
+	VMID        int    `json:"vmid"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	Hostname    string `json:"hostname,omitempty"`
+	ClusterName string `json:"cluster_name,omitempty"`
+	Generation  uint64 `json:"generation"`
 }
 
 type lifecycleStore struct {
@@ -97,14 +109,15 @@ func (s *lifecycleStore) snapshot() (lifecycleFile, error) {
 func (s *lifecycleStore) commit(next lifecycleFile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if next.Schema == 0 {
-		next.Schema = lifecycleSchemaVersion
-	}
+	next.Schema = lifecycleSchemaVersion
 	if next.Instances == nil {
 		next.Instances = make(map[string]lifecycleRecord)
 	}
 	if next.Tombstones == nil {
 		next.Tombstones = make(map[string]uint64)
+	}
+	if next.RetiredNames == nil {
+		next.RetiredNames = make(map[string]lifecycleRetiredName)
 	}
 	renamed, err := s.saveLocked(next)
 	if err != nil {
@@ -125,9 +138,10 @@ func (s *lifecycleStore) loadLocked() error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.data = lifecycleFile{
-				Schema:     lifecycleSchemaVersion,
-				Instances:  make(map[string]lifecycleRecord),
-				Tombstones: make(map[string]uint64),
+				Schema:       lifecycleSchemaVersion,
+				Instances:    make(map[string]lifecycleRecord),
+				Tombstones:   make(map[string]uint64),
+				RetiredNames: make(map[string]lifecycleRetiredName),
 			}
 			return nil
 		}
@@ -137,7 +151,7 @@ func (s *lifecycleStore) loadLocked() error {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return fmt.Errorf("decoding proxmox lifecycle state: %w", err)
 	}
-	if file.Schema != lifecycleSchemaVersion {
+	if file.Schema != 1 && file.Schema != lifecycleSchemaVersion {
 		return fmt.Errorf("unsupported proxmox lifecycle state schema %d", file.Schema)
 	}
 	if file.Instances == nil {
@@ -145,6 +159,21 @@ func (s *lifecycleStore) loadLocked() error {
 	}
 	if file.Tombstones == nil {
 		file.Tombstones = make(map[string]uint64)
+	}
+	if file.RetiredNames == nil {
+		file.RetiredNames = make(map[string]lifecycleRetiredName)
+	}
+	if file.Schema == 1 {
+		// Schema 1 kept names only while an instance was active or absent-pending.
+		// Preserve those identities before later observations can move them into
+		// generation-only tombstones. A tombstone-only v1 file has no name to migrate.
+		for key, record := range file.Instances {
+			if record.Key == "" {
+				record.Key = key
+			}
+			rememberLifecycleName(&file, record)
+		}
+		file.Schema = lifecycleSchemaVersion
 	}
 	s.data = file
 	return nil
@@ -214,7 +243,38 @@ func cloneLifecycleFile(file lifecycleFile) lifecycleFile {
 	for key, generation := range file.Tombstones {
 		clone.Tombstones[key] = generation
 	}
+	clone.RetiredNames = make(map[string]lifecycleRetiredName, len(file.RetiredNames))
+	for key, retired := range file.RetiredNames {
+		clone.RetiredNames[key] = retired
+	}
 	return clone
+}
+
+func rememberLifecycleName(file *lifecycleFile, record lifecycleRecord) {
+	hostname := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Hostname), "."))
+	if strings.TrimSpace(record.Name) == "" || hostname == "" || file == nil {
+		return
+	}
+	if file.RetiredNames == nil {
+		file.RetiredNames = make(map[string]lifecycleRetiredName)
+	}
+	if record.Generation == 0 {
+		record.Generation = 1
+	}
+	key := record.Key
+	if key == "" {
+		key = lifecycleIdentity(record.ClusterName, ClusterResource{Type: record.Type, VMID: record.VMID})
+	}
+	retiredKey := fmt.Sprintf("%s|generation:%d|hostname:%s", key, record.Generation, hostname)
+	file.RetiredNames[retiredKey] = lifecycleRetiredName{
+		Key:         key,
+		VMID:        record.VMID,
+		Type:        record.Type,
+		Name:        record.Name,
+		Hostname:    hostname,
+		ClusterName: record.ClusterName,
+		Generation:  record.Generation,
+	}
 }
 
 func clusterIdentity(raw string) string {

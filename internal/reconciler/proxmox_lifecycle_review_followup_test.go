@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http/httptest"
 	"os"
@@ -315,13 +316,27 @@ func assertAA93LifecycleTombstone(t *testing.T, stateFile string) {
 		t.Fatalf("read lifecycle tombstone: %v", err)
 	}
 	var persisted struct {
-		Instances  map[string]json.RawMessage `json:"instances"`
-		Tombstones map[string]uint64          `json:"tombstones"`
+		Schema       int                        `json:"schema"`
+		Instances    map[string]json.RawMessage `json:"instances"`
+		Tombstones   map[string]uint64          `json:"tombstones"`
+		RetiredNames map[string]struct {
+			Name        string `json:"name"`
+			Hostname    string `json:"hostname"`
+			ClusterName string `json:"cluster_name"`
+		} `json:"retired_names"`
 	}
 	if err := json.Unmarshal(data, &persisted); err != nil {
 		t.Fatalf("decode lifecycle tombstone: %v", err)
 	}
-	if len(persisted.Instances) != 0 || persisted.Tombstones[reviewFollowupIdentity] != 1 {
+	retiredNameFound := false
+	for _, retired := range persisted.RetiredNames {
+		if retired.Name == "web" && retired.Hostname == reviewFollowupHost && retired.ClusterName == "test-cluster" {
+			retiredNameFound = true
+			break
+		}
+	}
+	if persisted.Schema != 2 || len(persisted.Instances) != 0 ||
+		persisted.Tombstones[reviewFollowupIdentity] != 1 || !retiredNameFound {
 		t.Fatalf("state file is not at confirmed absence: %s", data)
 	}
 }
@@ -354,7 +369,8 @@ func assertRelatedHTTPSOwnershipMarker(t *testing.T, api *proxmoxManualRRsetAPI,
 			continue
 		}
 		owned, _, member, metadata := provider.ParseMemberOwnershipValue(record.Target)
-		if owned && member != nil && member.Type == provider.RecordTypeA && metadata[relatedHTTPSOwnershipKey] == "true" {
+		fingerprint, err := hex.DecodeString(metadata[relatedHTTPSOwnershipKey])
+		if owned && member != nil && member.Type == provider.RecordTypeA && err == nil && len(fingerprint) == 32 {
 			return
 		}
 	}
@@ -364,7 +380,8 @@ func assertRelatedHTTPSOwnershipMarker(t *testing.T, api *proxmoxManualRRsetAPI,
 func assertRelatedHTTPSOwnershipInPendingRepair(t *testing.T, r *Reconciler) {
 	t.Helper()
 	for _, repair := range r.pendingMemberOwnership {
-		if repair.Record.Metadata[relatedHTTPSOwnershipKey] == "true" &&
+		fingerprint, err := hex.DecodeString(repair.Record.Metadata[relatedHTTPSOwnershipKey])
+		if err == nil && len(fingerprint) == 32 &&
 			repair.Record.Metadata[statefulProxmoxOwnershipKey] == "true" {
 			return
 		}
