@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -177,15 +178,17 @@ func TestProxmoxLifecycleNodeMigrationUsesOneDesiredMember(t *testing.T) {
 }
 
 type proxmoxDNSFixture struct {
-	mu              sync.Mutex
-	resources       []proxmoxclient.ClusterResource
-	interfaces      []proxmoxclient.AgentNetworkInterface
-	agentError      bool
-	agentEmpty      bool
-	agentEmptyVMIDs map[string]bool
-	inventoryError  bool
-	lxcConfig       map[string]string
-	lxcInterfaces   []proxmoxclient.LXCInterface
+	mu                       sync.Mutex
+	resources                []proxmoxclient.ClusterResource
+	interfaces               []proxmoxclient.AgentNetworkInterface
+	interfacesByVMID         map[string][]proxmoxclient.AgentNetworkInterface
+	agentError               bool
+	agentErrorMessagesByVMID map[string]string
+	agentEmpty               bool
+	agentEmptyVMIDs          map[string]bool
+	inventoryError           bool
+	lxcConfig                map[string]string
+	lxcInterfaces            []proxmoxclient.LXCInterface
 }
 
 func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -206,11 +209,6 @@ func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api2/json/cluster/status":
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": []proxmoxclient.ClusterStatusEntry{{Type: "cluster", Name: "test-cluster"}}})
 	case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
-		if f.agentError {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = io.WriteString(w, `{"errors":{"command":"QEMU guest agent is not running"}}`)
-			return
-		}
 		segments := strings.Split(r.URL.Path, "/")
 		vmid := ""
 		for i, segment := range segments {
@@ -219,11 +217,25 @@ func (f *proxmoxDNSFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		if message, unavailable := f.agentErrorMessagesByVMID[vmid]; unavailable {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": nil, "message": message})
+			return
+		}
+		if f.agentError {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"errors":{"command":"QEMU guest agent is not running"}}`)
+			return
+		}
 		if f.agentEmpty || f.agentEmptyVMIDs[vmid] {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"result": []proxmoxclient.AgentNetworkInterface{}}})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"result": f.interfaces}})
+		interfaces := f.interfaces
+		if byVMID, ok := f.interfacesByVMID[vmid]; ok {
+			interfaces = byVMID
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"result": interfaces}})
 	case strings.HasSuffix(r.URL.Path, "/lxc/200/config"):
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": f.lxcConfig})
 	case strings.HasSuffix(r.URL.Path, "/lxc/200/interfaces"):
@@ -399,6 +411,98 @@ func TestProxmoxStatefulLifecycleEndToEndRetainsAndCleansDNSSafely(t *testing.T)
 	}
 	if answers = dnsAnswerRecords(ctx, t, backend); len(answers) != 0 {
 		t.Fatalf("VMID reuse inherited old DNS answer: %+v", answers)
+	}
+}
+
+func TestProxmoxStatefulQGAUnavailablePreservesVMAndUpdatesPeer(t *testing.T) {
+	const unavailableMessage = "QEMU guest agent is not running\n"
+	fixture := &proxmoxDNSFixture{
+		resources: []proxmoxclient.ClusterResource{
+			{VMID: 100, Name: "web", Node: "pve-00", Type: "qemu", Status: "running"},
+			{VMID: 101, Name: "api", Node: "pve-01", Type: "qemu", Status: "running"},
+		},
+		interfacesByVMID: map[string][]proxmoxclient.AgentNetworkInterface{
+			"100": {{Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.100"}}}},
+			"101": {{Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.101"}}}},
+		},
+	}
+	_, client := newProxmoxFixtureClient(t, fixture)
+	stateFile := filepath.Join(t.TempDir(), "proxmox-lifecycle.json")
+	r, backend, _ := newStatefulProxmoxDNSReconciler(t, client, stateFile, nil)
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	assertAnswers := func(want map[string]string) {
+		t.Helper()
+		answers := dnsAnswerRecords(ctx, t, backend)
+		got := make(map[string]string, len(answers))
+		for _, answer := range answers {
+			got[answer.Hostname] = answer.Target
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("DNS answers = %v, want %v", got, want)
+		}
+	}
+	assertAnswers(map[string]string{
+		"web.test-cluster.example.com": "10.20.0.100",
+		"api.test-cluster.example.com": "10.20.0.101",
+	})
+
+	fixture.mu.Lock()
+	fixture.agentErrorMessagesByVMID = map[string]string{"100": unavailableMessage}
+	fixture.interfacesByVMID["101"] = []proxmoxclient.AgentNetworkInterface{{
+		Name: "eth0", IPAddresses: []proxmoxclient.AgentIPAddress{{IPAddress: "10.20.0.102"}},
+	}}
+	fixture.mu.Unlock()
+
+	if _, err := r.Reconcile(ctx); err != nil {
+		t.Errorf("reconcile with VM100 QGA unavailable and VM101 address change: %v", err)
+	}
+	assertAnswers(map[string]string{
+		"web.test-cluster.example.com": "10.20.0.100",
+		"api.test-cluster.example.com": "10.20.0.102",
+	})
+
+	stateBytes, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read persisted lifecycle state: %v", err)
+	}
+	var persisted struct {
+		Instances map[string]struct {
+			VMID   int    `json:"vmid"`
+			Status string `json:"status"`
+			LastIP struct {
+				V4 string `json:"V4"`
+			} `json:"last_confirmed_ips"`
+		} `json:"instances"`
+	}
+	if err := json.Unmarshal(stateBytes, &persisted); err != nil {
+		t.Fatalf("decode persisted lifecycle state: %v", err)
+	}
+	for vmid, want := range map[int]struct {
+		status string
+		ip     string
+	}{
+		100: {status: proxmoxclient.LifecycleStateQGAUnavailable, ip: "10.20.0.100"},
+		101: {status: proxmoxclient.LifecycleStateRunningAddress, ip: "10.20.0.102"},
+	} {
+		var found bool
+		for _, instance := range persisted.Instances {
+			if instance.VMID != vmid {
+				continue
+			}
+			found = true
+			if instance.Status != want.status || instance.LastIP.V4 != want.ip {
+				t.Errorf("persisted VM%d status/IP = %q/%q, want %q/%q",
+					vmid, instance.Status, instance.LastIP.V4, want.status, want.ip)
+			}
+			break
+		}
+		if !found {
+			t.Errorf("persisted lifecycle state has no VM%d record: %+v", vmid, persisted.Instances)
+		}
 	}
 }
 

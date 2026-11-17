@@ -143,30 +143,93 @@ func TestGetVMAgentNetworks(t *testing.T) {
 	}
 }
 
-func TestGetVMAgentNetworks_AgentNotRunning(t *testing.T) {
-	_, client := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		resp := map[string]any{
-			"errors": map[string]string{
-				"command": "QEMU guest agent is not running",
-			},
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	})
-
-	_, err := client.GetVMAgentNetworks(context.Background(), "pve-00", 100)
-	if err == nil {
-		t.Fatal("expected error, got nil")
+func TestGetVMAgentNetworks_AgentNotRunningResponseShapes(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		nonAgentAPI bool
+		wantAgent   bool
+	}{
+		{
+			name:      "real top-level message",
+			status:    http.StatusInternalServerError,
+			body:      `{"data":null,"message":"QEMU guest agent is not running\n"}`,
+			wantAgent: true,
+		},
+		{
+			name:      "legacy errors map",
+			status:    http.StatusInternalServerError,
+			body:      `{"errors":{"command":"QEMU guest agent is not running"}}`,
+			wantAgent: true,
+		},
+		{
+			name:   "unrelated server failure",
+			status: http.StatusInternalServerError,
+			body:   `{"message":"storage backend unavailable"}`,
+		},
+		{
+			name:      "unauthorized is not an agent outage",
+			status:    http.StatusUnauthorized,
+			body:      `{"message":"QEMU guest agent is not running"}`,
+			wantAgent: false,
+		},
+		{
+			name:   "forbidden is not an agent outage",
+			status: http.StatusForbidden,
+			body:   `{"message":"QEMU guest agent is not running"}`,
+		},
+		{
+			name:   "invalid JSON",
+			status: http.StatusInternalServerError,
+			body:   `{"data":null,"message":`,
+		},
+		{
+			name:   "non-matching message",
+			status: http.StatusInternalServerError,
+			body:   `{"message":"QEMU guest agent is unavailable"}`,
+		},
+		{
+			name:        "same message on non-agent endpoint",
+			status:      http.StatusInternalServerError,
+			body:        `{"data":null,"message":"QEMU guest agent is not running\n"}`,
+			nonAgentAPI: true,
+		},
 	}
 
-	var agentErr *ErrAgentNotRunning
-	if !errors.As(err, &agentErr) {
-		t.Errorf("expected *ErrAgentNotRunning, got %T: %v", err, err)
-		return
-	}
-	if agentErr.Node != "pve-00" || agentErr.VMID != 100 {
-		t.Errorf("agent error identity = %s/%d, want pve-00/100", agentErr.Node, agentErr.VMID)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, client := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			})
+
+			var err error
+			if tt.nonAgentAPI {
+				err = client.get(context.Background(), "/api2/json/nodes/pve-00/qemu/100/config", &struct{}{})
+			} else {
+				_, err = client.GetVMAgentNetworks(context.Background(), "pve-00", 100)
+			}
+			if err == nil {
+				t.Fatal("expected API error, got nil")
+			}
+
+			var agentErr *ErrAgentNotRunning
+			if errors.As(err, &agentErr) != tt.wantAgent {
+				t.Fatalf("ErrAgentNotRunning classification = %v, want %v; err=%T: %v",
+					errors.As(err, &agentErr), tt.wantAgent, err, err)
+			}
+			if tt.wantAgent && (agentErr.Node != "pve-00" || agentErr.VMID != 100) {
+				t.Errorf("agent error identity = %s/%d, want pve-00/100", agentErr.Node, agentErr.VMID)
+			}
+			if !tt.wantAgent && !tt.nonAgentAPI {
+				var apiErr *apiError
+				if !errors.As(err, &apiErr) {
+					t.Errorf("non-agent response should remain an API error, got %T: %v", err, err)
+				}
+			}
+		})
 	}
 }
 
